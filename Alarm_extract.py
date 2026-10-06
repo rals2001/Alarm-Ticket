@@ -1,5 +1,5 @@
 """
-PMT Alarm – Closed Alarm downloader (3-step workflow)
+PMT Alarm – Closed Alarm downloader (3-step workflow, Playwright edition)
 
 STEP 1  Retrieve Excel  -> login + download the raw XLSX only (background thread)
 STEP 2  Filter Excel    -> stream the raw XLSX, keep the chosen Year-Month (background thread)
@@ -13,6 +13,8 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -26,23 +28,15 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.datetime import from_excel
-from selenium import webdriver
-from selenium.common.exceptions import (
-    ElementClickInterceptedException,
-    StaleElementReferenceException,
-    TimeoutException,
-)
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from playwright.sync_api import Error as PWError
+from playwright.sync_api import TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
 
 # ===================== CONFIGURATION =====================
 LOGIN_URL = "https://pmt-alarm.komdigi.go.id/auth/login"
 ALARM_URL = "https://pmt-alarm.komdigi.go.id/dashboard/alarm"
 DOWNLOAD_TIMEOUT = 900        # seconds to wait for the big export (15 min)
-DEFAULT_TIMEOUT = 40
+DEFAULT_TIMEOUT = 40          # seconds for normal waits
 DATE_COLUMN_NAME = "Data Created"
 JOBS_ROOT = Path(tempfile.gettempdir()) / "pmt_alarm_jobs"
 STALE_AFTER = 300             # a "running" step with no heartbeat for 5 min = interrupted
@@ -57,6 +51,8 @@ XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("pmt_alarm")
+
+_INSTALL_LOCK = threading.Lock()
 
 
 # =====================================================================
@@ -91,8 +87,9 @@ class StepReporter:
              "started": self.t0, "updated": time.time(), **extra},
         )
 
-    def running(self, message, progress=None):
-        job_log(self.job_dir, f"[step {self.step}] {message}")
+    def running(self, message, progress=None, quiet=False):
+        if not quiet:  # quiet = heartbeat only, don't spam the activity log
+            job_log(self.job_dir, f"[step {self.step}] {message}")
         self._write("running", message, progress)
 
     def done(self, message, **extra):
@@ -140,259 +137,169 @@ def source_ready(job_dir: Path) -> bool:
 
 
 # =====================================================================
-#  Selenium helpers (same logic as before)
+#  Playwright helpers
 # =====================================================================
-def build_driver(download_dir: Path) -> webdriver.Chrome:
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--window-size=1600,900")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    # keep Chromium's memory footprint small
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-background-networking")
-    options.add_argument("--disable-sync")
-    options.add_argument("--mute-audio")
-    options.add_argument("--disable-notifications")
-    options.add_argument("--disable-popup-blocking")
-    options.add_experimental_option("excludeSwitches", ["enable-logging"])
-
-    chromium = shutil.which("chromium") or shutil.which("chromium-browser")
-    if chromium:
-        options.binary_location = chromium
-
-    options.add_experimental_option(
-        "prefs",
-        {
-            "download.default_directory": str(download_dir),
-            "download.prompt_for_download": False,
-            "download.directory_upgrade": True,
-            "safebrowsing.enabled": False,  # avoids scanning a 90 MB file
-            "profile.default_content_setting_values.automatic_downloads": 1,
-            "profile.managed_default_content_settings.images": 2,  # no images
-        },
+def launch_browser(pw, job_dir: Path, dl_dir: Path):
+    """
+    Launch headless Chromium.
+    1) system Chromium (Streamlit Cloud via packages.txt) if available,
+    2) otherwise Playwright's own Chromium, installing it on first use.
+    """
+    kwargs = dict(
+        headless=True,
+        downloads_path=str(dl_dir),
+        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--mute-audio"],
     )
 
-    chromedriver = shutil.which("chromedriver")
-    if chromedriver:  # Streamlit Cloud (packages.txt)
-        service = Service(chromedriver)
-    else:  # local PC with regular Google Chrome
-        from webdriver_manager.chrome import ChromeDriverManager
-
-        service = Service(ChromeDriverManager().install())
-
-    driver = webdriver.Chrome(service=service, options=options)
-    try:
-        driver.execute_cdp_cmd(
-            "Page.setDownloadBehavior",
-            {"behavior": "allow", "downloadPath": str(download_dir)},
-        )
-    except Exception as exc:
-        log.debug("setDownloadBehavior not applied: %s", exc)
-    return driver
-
-
-def safe_click(driver, locator, timeout=DEFAULT_TIMEOUT, description="element"):
-    wait = WebDriverWait(driver, timeout)
-    last_exc = None
-    for attempt in range(1, 4):
+    system_chromium = shutil.which("chromium") or shutil.which("chromium-browser")
+    if system_chromium:
         try:
-            element = wait.until(EC.element_to_be_clickable(locator))
-            driver.execute_script(
-                "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", element
-            )
-            time.sleep(0.5)
+            job_log(job_dir, f"Using system Chromium: {system_chromium}")
+            return pw.chromium.launch(executable_path=system_chromium, **kwargs)
+        except PWError as exc:
+            job_log(job_dir, f"System Chromium failed ({str(exc)[:200]}); trying Playwright's own.", "WARNING")
+
+    try:
+        return pw.chromium.launch(**kwargs)
+    except PWError as exc:
+        if "playwright install" not in str(exc) and "Executable doesn't exist" not in str(exc):
+            raise
+    with _INSTALL_LOCK:
+        job_log(job_dir, "Installing Playwright Chromium (first run only, may take a minute)...")
+        proc = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=900,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"'playwright install chromium' failed: {proc.stderr[-500:] or proc.stdout[-500:]}")
+    return pw.chromium.launch(**kwargs)
+
+
+def click_first(page, selectors, description, total_timeout=DEFAULT_TIMEOUT):
+    """Try several selectors in turn; click the first visible one (JS-click fallback)."""
+    per = max(5000, int(total_timeout * 1000 / max(1, len(selectors))))
+    last_exc = None
+    for sel in selectors:
+        loc = page.locator(sel).first
+        try:
+            loc.wait_for(state="visible", timeout=per)
+            loc.scroll_into_view_if_needed(timeout=per)
             try:
-                element.click()
-            except (ElementClickInterceptedException, StaleElementReferenceException):
-                element = driver.find_element(*locator)
-                driver.execute_script("arguments[0].click();", element)
-            return element
-        except (TimeoutException, StaleElementReferenceException) as exc:
+                loc.click(timeout=per)
+            except PWError:
+                loc.evaluate("el => el.click()")
+            return
+        except PWError as exc:
             last_exc = exc
-            log.warning("Attempt %d to click %s failed: %s", attempt, description, type(exc).__name__)
-            time.sleep(1)
-    raise TimeoutException(f"Could not click {description}: {last_exc}")
+            log.warning("Selector failed for %s: %s", description, sel)
+    raise RuntimeError(f"Could not click {description}: {str(last_exc)[:200]}")
 
 
-def first_clickable(driver, locators, timeout=DEFAULT_TIMEOUT, description="element"):
-    per_locator_timeout = max(5, timeout // max(1, len(locators)))
-    last_exc = None
-    for loc in locators:
-        try:
-            return safe_click(driver, loc, timeout=per_locator_timeout, description=description)
-        except TimeoutException as exc:
-            last_exc = exc
-    raise TimeoutException(f"None of the locators worked for {description}: {last_exc}")
+UPPER = "translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')"
 
 
-def login(driver, username, password):
-    driver.get(LOGIN_URL)
-    wait = WebDriverWait(driver, DEFAULT_TIMEOUT)
-    user_field = wait.until(
-        EC.visibility_of_element_located(
-            (By.XPATH, "//input[@placeholder='Username' or @name='username' or @id='username']")
-        )
-    )
-    user_field.clear()
-    user_field.send_keys(username)
-    pass_field = wait.until(EC.visibility_of_element_located((By.XPATH, "//input[@type='password']")))
-    pass_field.clear()
-    pass_field.send_keys(password)
+def pw_login(page, username, password):
+    page.goto(LOGIN_URL, wait_until="load", timeout=60000)
+    user = page.locator(
+        "input[placeholder='Username'], input[name='username'], input#username"
+    ).first
+    user.wait_for(state="visible")
+    user.fill(username)
+    pwd = page.locator("input[type='password']").first
+    pwd.wait_for(state="visible")
+    pwd.fill(password)
 
-    first_clickable(
-        driver,
+    click_first(
+        page,
         [
-            (By.XPATH, "//button[normalize-space()='LOGIN' or normalize-space()='Login']"),
-            (By.XPATH, "//button[contains(translate(., 'login', 'LOGIN'), 'LOGIN')]"),
-            (By.XPATH, "//input[@type='submit']"),
-            (By.CSS_SELECTOR, "button[type='submit']"),
+            "xpath=//button[normalize-space()='LOGIN' or normalize-space()='Login']",
+            "xpath=//button[contains(translate(., 'login', 'LOGIN'), 'LOGIN')]",
+            "xpath=//input[@type='submit']",
+            "css=button[type='submit']",
         ],
-        description="LOGIN button",
+        "LOGIN button",
     )
     try:
-        WebDriverWait(driver, 60).until(lambda d: "/auth/login" not in d.current_url)
-    except TimeoutException:
+        page.wait_for_url(lambda url: "/auth/login" not in url, timeout=60000)
+    except PWTimeout:
         raise RuntimeError(
             "Login failed: still on the login page. Check username/password, "
             "or the site may require CAPTCHA/OTP or block this server's IP."
         )
 
 
-def open_alarm_page(driver):
-    driver.get(ALARM_URL)
-    WebDriverWait(driver, 60).until(
-        lambda d: d.execute_script("return document.readyState") == "complete"
-    )
-    if "/auth/login" in driver.current_url:
+def pw_open_alarm_page(page):
+    page.goto(ALARM_URL, wait_until="load", timeout=60000)
+    if "/auth/login" in page.url:
         raise RuntimeError("Redirected back to login page; session not authenticated.")
-    WebDriverWait(driver, DEFAULT_TIMEOUT).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(2)
+    page.wait_for_selector("body", state="attached")
+    page.wait_for_timeout(2000)
 
 
-def scroll_to_alarm_section(driver):
-    wait = WebDriverWait(driver, DEFAULT_TIMEOUT)
+def pw_scroll_to_alarm_section(page):
+    section = page.locator(
+        "xpath=//*[self::h1 or self::h2 or self::h3 or self::h4 or self::h5 or self::div or self::span]"
+        "[normalize-space()='Alarm' or normalize-space()='ALARM']"
+    ).first
     try:
-        section = wait.until(
-            EC.presence_of_element_located(
-                (
-                    By.XPATH,
-                    "//*[self::h1 or self::h2 or self::h3 or self::h4 or self::h5 or self::div or self::span]"
-                    "[normalize-space()='Alarm' or normalize-space()='ALARM']",
-                )
-            )
-        )
-        driver.execute_script("arguments[0].scrollIntoView({block: 'start'});", section)
-    except TimeoutException:
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    time.sleep(1)
+        section.wait_for(state="attached")
+        section.evaluate("el => el.scrollIntoView({block: 'start'})")
+    except PWError:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page.wait_for_timeout(1000)
 
 
-def click_closed_alarm_tab(driver):
-    first_clickable(
-        driver,
+def pw_click_closed_alarm_tab(page):
+    click_first(
+        page,
         [
-            (
-                By.XPATH,
-                "//*[(self::button or self::a or self::li or self::div or self::span or @role='tab')]"
-                "[normalize-space()='CLOSED ALARM' or normalize-space()='Closed Alarm']",
-            ),
-            (
-                By.XPATH,
-                "//*[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', "
-                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'CLOSED ALARM')"
-                " and (self::button or self::a or @role='tab' or self::li)]",
-            ),
+            "xpath=//*[(self::button or self::a or self::li or self::div or self::span or @role='tab')]"
+            "[normalize-space()='CLOSED ALARM' or normalize-space()='Closed Alarm']",
+            f"xpath=//*[contains({UPPER}, 'CLOSED ALARM') and (self::button or self::a or @role='tab' or self::li)]",
         ],
-        description="CLOSED ALARM tab",
+        "CLOSED ALARM tab",
     )
-    wait = WebDriverWait(driver, 60)
-    wait.until(EC.presence_of_element_located((By.XPATH, "//table")))
+    page.wait_for_selector("table", state="attached", timeout=60000)
     try:
-        wait.until(EC.presence_of_element_located((By.XPATH, "//table//tbody//tr")))
-    except TimeoutException:
+        page.wait_for_selector("table tbody tr", state="attached", timeout=DEFAULT_TIMEOUT * 1000)
+    except PWTimeout:
         pass
     try:
-        WebDriverWait(driver, 10).until(
-            EC.invisibility_of_element_located(
-                (
-                    By.CSS_SELECTOR,
-                    ".spinner, .loading, .loader, .spinner-border, [class*='loading'], [class*='spinner']",
-                )
-            )
+        page.wait_for_selector(
+            ".spinner, .loading, .loader, .spinner-border, [class*='loading'], [class*='spinner']",
+            state="hidden", timeout=10000,
         )
-    except TimeoutException:
+    except PWError:
         pass
-    time.sleep(1)
+    page.wait_for_timeout(1000)
 
 
-def click_download_and_all_page(driver):
-    upper = "translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')"
-    first_clickable(
-        driver,
+def pw_click_download_and_all_page(page):
+    click_first(
+        page,
         [
-            (By.XPATH, f"//button[contains({upper}, 'DOWNLOAD ALARM')]"),
-            (By.XPATH, f"//*[contains({upper}, 'DOWNLOAD ALARM') and (self::a or self::button or @role='button')]"),
-            (By.CSS_SELECTOR, "button.btn-success"),
+            f"xpath=//button[contains({UPPER}, 'DOWNLOAD ALARM')]",
+            f"xpath=//*[contains({UPPER}, 'DOWNLOAD ALARM') and (self::a or self::button or @role='button')]",
+            "css=button.btn-success",
         ],
-        description="Download Alarm button",
+        "Download Alarm button",
     )
-    first_clickable(
-        driver,
+    click_first(
+        page,
         [
-            (
-                By.XPATH,
-                "//*[(self::a or self::button or self::li or self::span or self::div "
-                "or @role='menuitem') and (normalize-space()='All Page' or normalize-space()='All page')]",
-            ),
-            (
-                By.XPATH,
-                f"//*[contains({upper}, 'ALL PAGE') and (self::a or self::button or self::li or @role='menuitem')]",
-            ),
+            "xpath=//*[(self::a or self::button or self::li or self::span or self::div "
+            "or @role='menuitem') and (normalize-space()='All Page' or normalize-space()='All page')]",
+            f"xpath=//*[contains({UPPER}, 'ALL PAGE') and (self::a or self::button or self::li or @role='menuitem')]",
         ],
-        description="All Page option",
+        "All Page option",
     )
 
 
-def snapshot_files(folder: Path):
-    return {p.name: p.stat().st_mtime for p in folder.iterdir() if p.is_file()}
-
-
-def wait_for_download_complete(folder: Path, before: dict, on_tick, timeout=DOWNLOAD_TIMEOUT) -> str:
-    """Wait for a new, size-stable .xlsx. Calls on_tick(elapsed_s, size_mb) every ~3 s."""
-    start = time.time()
-    last_tick = 0.0
-    last_size, stable = {}, 0
-
-    while time.time() - start < timeout:
-        files = [p for p in folder.iterdir() if p.is_file()]
-        in_progress = [p for p in files if p.suffix.lower() in (".crdownload", ".tmp")]
-        new_files = [
-            p for p in files
-            if p.suffix.lower() in (".xlsx", ".xls")
-            and not p.name.startswith("~$")
-            and (p.name not in before or p.stat().st_mtime > before[p.name])
-        ]
-
-        if time.time() - last_tick >= 3:
-            last_tick = time.time()
-            current = in_progress + new_files
-            size_mb = max((p.stat().st_size for p in current), default=0) / 1024 / 1024
-            on_tick(time.time() - start, size_mb)
-
-        if new_files and not in_progress:
-            newest = max(new_files, key=lambda p: p.stat().st_mtime)
-            size = newest.stat().st_size
-            stable = stable + 1 if (last_size.get(newest.name) == size and size > 0) else 0
-            last_size[newest.name] = size
-            if stable >= 3:
-                return newest.name
-        else:
-            stable = 0
-        time.sleep(1)
-
-    raise TimeoutException(f"Download did not complete within {timeout} seconds.")
+def dir_biggest_file_mb(folder: Path) -> float:
+    try:
+        return max((p.stat().st_size for p in folder.rglob("*") if p.is_file()), default=0) / 1024 / 1024
+    except OSError:
+        return 0.0
 
 
 # =====================================================================
@@ -401,62 +308,96 @@ def wait_for_download_complete(folder: Path, before: dict, on_tick, timeout=DOWN
 def retrieve_worker(job_dir: Path, username: str, password: str):
     rep = StepReporter(job_dir, 1)
     dl_dir = job_dir / "dl"
+    part = job_dir / "source.xlsx.part"
     shutil.rmtree(dl_dir, ignore_errors=True)
     dl_dir.mkdir(parents=True, exist_ok=True)
-    driver = None
-    try:
-        rep.running("Starting browser...", 0.05)
-        driver = build_driver(dl_dir)
+    part.unlink(missing_ok=True)
 
-        rep.running("Logging in...", 0.15)
-        login(driver, username, password)
+    stop_hb = threading.Event()
 
-        rep.running("Opening alarm page...", 0.25)
-        open_alarm_page(driver)
-        scroll_to_alarm_section(driver)
-
-        rep.running("Opening CLOSED ALARM tab...", 0.30)
-        click_closed_alarm_tab(driver)
-
-        before = snapshot_files(dl_dir)
-        rep.running("Requesting full export (All Page)...", 0.35)
-        click_download_and_all_page(driver)
-
-        def tick(elapsed, size_mb):
-            mins, secs = divmod(int(elapsed), 60)
+    def heartbeat():
+        """Keeps the status fresh while Playwright blocks waiting for the big file."""
+        t0 = time.time()
+        while not stop_hb.wait(3):
+            if time.time() - t0 > DOWNLOAD_TIMEOUT * 2:
+                break
+            mins, secs = divmod(int(time.time() - t0), 60)
             rep.running(
                 f"Waiting for the server to prepare/send the file... "
-                f"{mins}m {secs:02d}s elapsed, {size_mb:.1f} MB received so far",
-                0.40,
+                f"{mins}m {secs:02d}s elapsed, {dir_biggest_file_mb(dl_dir):.1f} MB received so far",
+                0.40, quiet=True,
             )
 
-        filename = wait_for_download_complete(dl_dir, before, tick)
+    try:
+        rep.running("Starting browser...", 0.05)
+        with sync_playwright() as pw:
+            browser = launch_browser(pw, job_dir, dl_dir)
+            page = None
+            try:
+                context = browser.new_context(accept_downloads=True, viewport={"width": 1600, "height": 900})
+                # save memory/bandwidth: don't load images or media
+                context.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in ("image", "media")
+                    else route.continue_(),
+                )
+                page = context.new_page()
+                page.set_default_timeout(DEFAULT_TIMEOUT * 1000)
 
-        rep.running("Download finished, closing browser...", 0.95)
-        driver.quit()
-        driver = None
+                rep.running("Logging in...", 0.15)
+                pw_login(page, username, password)
 
-        os.replace(dl_dir / filename, source_path(job_dir))
+                rep.running("Opening alarm page...", 0.25)
+                pw_open_alarm_page(page)
+                pw_scroll_to_alarm_section(page)
+
+                rep.running("Opening CLOSED ALARM tab...", 0.30)
+                pw_click_closed_alarm_tab(page)
+
+                rep.running("Requesting full export (All Page)...", 0.35)
+                hb = threading.Thread(target=heartbeat, daemon=True)
+                hb.start()
+                try:
+                    with page.expect_download(timeout=DOWNLOAD_TIMEOUT * 1000) as dl_info:
+                        pw_click_download_and_all_page(page)
+                    download = dl_info.value
+                    job_log(job_dir, f"Download started: {download.suggested_filename}")
+                    download.save_as(str(part))  # blocks until the file is complete
+                    failure = download.failure()
+                    if failure:
+                        raise RuntimeError(f"Browser reported a download failure: {failure}")
+                finally:
+                    stop_hb.set()
+                    hb.join(timeout=5)
+                original_name = download.suggested_filename
+            except Exception:
+                if page is not None:
+                    try:
+                        page.screenshot(path=str(job_dir / "error.png"))
+                    except Exception:
+                        pass
+                raise
+            finally:
+                try:
+                    browser.close()  # free memory before Step 2
+                except Exception:
+                    pass
+
+        os.replace(part, source_path(job_dir))
         size_mb = source_path(job_dir).stat().st_size / 1024 / 1024
         rep.done(
             f"Download complete: {size_mb:.1f} MB saved on the server.",
             size_mb=round(size_mb, 1),
-            original_name=filename,
+            original_name=original_name,
         )
     except Exception as exc:
         job_log(job_dir, traceback.format_exc(), "ERROR")
-        if driver is not None:
-            try:
-                (job_dir / "error.png").write_bytes(driver.get_screenshot_as_png())
-            except Exception:
-                pass
-        rep.fail(str(exc) or type(exc).__name__)
+        message = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+        rep.fail(message)
     finally:
-        if driver is not None:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+        stop_hb.set()
+        part.unlink(missing_ok=True)
         shutil.rmtree(dl_dir, ignore_errors=True)
 
 
@@ -597,7 +538,7 @@ def filter_worker(job_dir: Path, year: int, month: int):
 
         def progress(total, est, kept):
             frac = min(total / est, 0.98) if est and est > 0 else None
-            rep.running(f"Filtering {label}: {total:,} rows scanned, {kept:,} kept so far...", frac)
+            rep.running(f"Filtering {label}: {total:,} rows scanned, {kept:,} kept so far...", frac, quiet=True)
 
         stats = stream_filter(src, part, year, month, progress)
 
