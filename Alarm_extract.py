@@ -433,7 +433,7 @@ with st.form("download_form"):
     year = c1.selectbox("Year", years, index=0)
     month_name = c2.selectbox("Month", MONTHS, index=cur_month - 1)
 
-    submitted = st.form_submit_button("Download & Filter", type="primary", use_container_width=True)
+    submitted = st.form_submit_button("Download", type="primary", use_container_width=True)
 
 if submitted:
     st.session_state.pop("result", None)
