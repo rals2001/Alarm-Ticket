@@ -8,6 +8,7 @@ STEP 3  Download Result -> hand the processed XLSX to the browser (no processing
 All state lives on disk in a per-session job folder (not only in st.session_state),
 so it survives websocket reconnects and page refreshes (the job id is kept in the URL).
 """
+import faulthandler
 import json
 import logging
 import os
@@ -32,6 +33,11 @@ from playwright.sync_api import Error as PWError
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
+try:
+    import psutil
+except ImportError:  # diagnostics degrade gracefully
+    psutil = None
+
 # ===================== CONFIGURATION =====================
 LOGIN_URL = "https://pmt-alarm.komdigi.go.id/auth/login"
 ALARM_URL = "https://pmt-alarm.komdigi.go.id/dashboard/alarm"
@@ -42,6 +48,10 @@ JOBS_ROOT = Path(tempfile.gettempdir()) / "pmt_alarm_jobs"
 STALE_AFTER = 300             # a "running" step with no heartbeat for 5 min = interrupted
 JOB_MAX_AGE_HOURS = 12
 POLL_SECONDS = 3
+MEM_GUARD_FRACTION = 0.85     # kill Chromium when the container reaches 85 % of its memory limit
+MEM_LIMIT_MB_OVERRIDE = float(os.environ.get("MEM_LIMIT_MB", 0)) or None  # force a limit if auto-detect fails
+MONITOR_INTERVAL = 2          # seconds between diagnostic samples
+BLOCK_IMAGES = True           # set False to test whether request interception matters
 MONTHS = [
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
@@ -51,6 +61,7 @@ XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("pmt_alarm")
+faulthandler.enable()  # prints a Python traceback to the app log on fatal signals (SIGSEGV, SIGABRT...)
 
 _INSTALL_LOCK = threading.Lock()
 
@@ -137,6 +148,273 @@ def source_ready(job_dir: Path) -> bool:
 
 
 # =====================================================================
+#  Diagnostics: container memory, process tree, disk, browser events
+# =====================================================================
+def _read_int(path):
+    try:
+        raw = Path(path).read_text().strip()
+        return None if raw == "max" else int(raw)
+    except Exception:
+        return None
+
+
+def _mb(v):
+    return None if v is None else v / 1024 / 1024
+
+
+def cgroup_memory() -> dict:
+    """Container memory from cgroup v2 (or v1). This is the number the platform enforces."""
+    used = _read_int("/sys/fs/cgroup/memory.current")
+    limit = _read_int("/sys/fs/cgroup/memory.max")
+    peak = _read_int("/sys/fs/cgroup/memory.peak")
+    if used is None:  # cgroup v1
+        used = _read_int("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        limit = _read_int("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        peak = _read_int("/sys/fs/cgroup/memory/memory.max_usage_in_bytes")
+    if limit is not None and limit > (1 << 40):  # v1 "unlimited"
+        limit = None
+    oom = None
+    try:
+        for line in Path("/sys/fs/cgroup/memory.events").read_text().splitlines():
+            if line.startswith("oom_kill "):
+                oom = int(line.split()[1])
+    except Exception:
+        pass
+    return {"used_mb": _mb(used), "limit_mb": MEM_LIMIT_MB_OVERRIDE or _mb(limit),
+            "peak_mb": _mb(peak), "oom_kills": oom}
+
+
+def process_tree():
+    """[(pid, role, status, rss_mb)] for this process and every child (node driver, Chromium...)."""
+    out = []
+    if psutil is None:
+        return out
+    try:
+        me = psutil.Process(os.getpid())
+        for p in [me] + me.children(recursive=True):
+            try:
+                cmd = " ".join(p.cmdline())
+                name = p.name()
+                m = re.search(r"--type=([\w-]+)", cmd)
+                if p.pid == me.pid:
+                    role = "streamlit"
+                elif name.startswith("node"):
+                    role = "playwright-node"
+                elif "chrom" in name.lower() or "chrom" in cmd.lower():
+                    role = "chromium-" + (m.group(1) if m else "browser")
+                else:
+                    role = name
+                out.append((p.pid, role, p.status(), p.memory_info().rss / 1048576))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def kill_browser_processes(job_dir: Path):
+    """Last-resort: kill the node driver + Chromium so the container itself is not OOM-killed."""
+    if psutil is None:
+        return
+    try:
+        for p in psutil.Process(os.getpid()).children(recursive=True):
+            try:
+                p.kill()
+            except Exception:
+                pass
+        job_log(job_dir, "Killed all browser child processes (memory guard).", "ERROR")
+    except Exception as exc:
+        job_log(job_dir, f"Could not kill browser processes: {exc}", "ERROR")
+
+
+def collect_snapshot(dl_dir: Path) -> dict:
+    cg = cgroup_memory()
+    tree = process_tree()
+    chrom = [t for t in tree if t[1].startswith("chromium")]
+    used = cg["used_mb"]
+    if used is None and tree:  # no cgroup files: approximate with process RSS
+        used = sum(t[3] for t in tree)
+    files = []
+    try:
+        files = [(p.name, p.stat().st_size / 1048576) for p in dl_dir.rglob("*") if p.is_file()]
+    except OSError:
+        pass
+    try:
+        disk_tmp = shutil.disk_usage(tempfile.gettempdir()).free / 1048576
+    except OSError:
+        disk_tmp = None
+    try:
+        disk_shm = shutil.disk_usage("/dev/shm").free / 1048576
+    except OSError:
+        disk_shm = None
+    return {
+        "used": used, "limit": cg["limit_mb"], "peak": cg["peak_mb"], "oom": cg["oom_kills"],
+        "chrom_n": len(chrom), "chrom_rss": sum(t[3] for t in chrom),
+        "chrom_top": sorted(chrom, key=lambda t: -t[3])[:4],
+        "tree": tree, "files": files,
+        "dl_mb": max((f[1] for f in files), default=0.0),
+        "disk_tmp": disk_tmp, "disk_shm": disk_shm,
+    }
+
+
+def format_snapshot(s: dict) -> str:
+    def f(v, unit="MB"):
+        return "?" if v is None else f"{v:.0f}{unit}"
+
+    pct = f" ({s['used'] / s['limit']:.0%})" if s["used"] is not None and s["limit"] else ""
+    top = ", ".join(f"{t[1].replace('chromium-', '')} {t[3]:.0f}" for t in s["chrom_top"]) or "none"
+    return (
+        f"mem {f(s['used'])}/{f(s['limit'])}{pct} peak={f(s['peak'])} oom_kills={s['oom']} | "
+        f"chromium procs={s['chrom_n']} rss={f(s['chrom_rss'])} [{top}] | "
+        f"download files={len(s['files'])} biggest={s['dl_mb']:.1f}MB | "
+        f"free: tmp={f(s['disk_tmp'])} shm={f(s['disk_shm'])}"
+    )
+
+
+def log_system_info(job_dir: Path):
+    try:
+        from importlib.metadata import version
+
+        pw_version = version("playwright")
+    except Exception:
+        pw_version = "?"
+    cg = cgroup_memory()
+    total = f"{psutil.virtual_memory().total / 1048576:.0f}MB" if psutil else "?"
+    job_log(
+        job_dir,
+        f"SYSTEM: python={sys.version.split()[0]} playwright={pw_version} cpus={os.cpu_count()} "
+        f"host_RAM={total} container_limit={cg['limit_mb'] and round(cg['limit_mb'])}MB "
+        f"chromium={shutil.which('chromium') or shutil.which('chromium-browser')} psutil={'yes' if psutil else 'NO'}",
+    )
+
+
+class DiagnosticsMonitor(threading.Thread):
+    """
+    Samples container memory / process tree / download dir every few seconds, writes them to the log
+    (stdout + job.log), refreshes the progress message, and kills Chromium before the container hits
+    its memory limit so the app survives and shows a clear error.
+    """
+
+    def __init__(self, job_dir: Path, dl_dir: Path, rep: StepReporter):
+        super().__init__(daemon=True)
+        self.job_dir, self.dl_dir, self.rep = job_dir, dl_dir, rep
+        self.stop_evt = threading.Event()
+        self.t0 = time.time()
+        self.phase = "starting"
+        self.tripped = None
+        self.peak_used = 0.0
+        self.peak_chromium = 0.0
+        self._seen_chromium = False
+        self._gone_logged = False
+        self._last_logged = 0.0
+        self._last_used = 0.0
+
+    def run(self):
+        while not self.stop_evt.wait(MONITOR_INTERVAL):
+            try:
+                self._tick()
+            except Exception as exc:
+                log.warning("monitor error: %s", exc)
+
+    def stop(self):
+        self.stop_evt.set()
+
+    def _tick(self):
+        now = time.time()
+        elapsed = now - self.t0
+        s = collect_snapshot(self.dl_dir)
+        used = s["used"] or 0.0
+        self.peak_used = max(self.peak_used, used)
+        self.peak_chromium = max(self.peak_chromium, s["chrom_rss"])
+
+        if s["chrom_n"]:
+            self._seen_chromium = True
+        elif self._seen_chromium and not self._gone_logged:
+            self._gone_logged = True
+            job_log(self.job_dir, "!!! ALL CHROMIUM PROCESSES ARE GONE (browser exited or was killed). "
+                                  f"Last memory state: {format_snapshot(s)}", "ERROR")
+
+        # log every tick for the first 90 s, then every 10 s, and on any +100 MB jump
+        if elapsed < 90 or now - self._last_logged >= 10 or used - self._last_used >= 100:
+            self._last_logged, self._last_used = now, used
+            job_log(self.job_dir, f"MON +{int(elapsed)}s [{self.phase}] {format_snapshot(s)}")
+
+        if self.phase == "export" and not self.tripped:
+            mins, secs = divmod(int(elapsed), 60)
+            lim = f"/{s['limit']:.0f}" if s["limit"] else ""
+            self.rep.running(
+                f"Waiting for the server to prepare/send the file... {mins}m {secs:02d}s elapsed, "
+                f"{s['dl_mb']:.1f} MB received · memory {used:.0f}{lim} MB",
+                0.40, quiet=True,
+            )
+
+        limit = s["limit"]
+        if limit and used > limit * MEM_GUARD_FRACTION and not self.tripped:
+            self.tripped = (
+                f"Memory guard stopped Chromium: the container reached {used:.0f} MB of its {limit:.0f} MB limit "
+                f"({used / limit:.0%}) during the export. Chromium used {s['chrom_rss']:.0f} MB."
+            )
+            job_log(self.job_dir, f"!!! {self.tripped}", "ERROR")
+            for pid, role, status, rss in sorted(s["tree"], key=lambda t: -t[3])[:8]:
+                job_log(self.job_dir, f"    pid={pid} {role} status={status} rss={rss:.0f}MB", "ERROR")
+            kill_browser_processes(self.job_dir)
+
+
+def attach_diagnostics(job_dir: Path, browser, page):
+    """Log Chromium crashes, console errors, failed requests, and the network calls around the export."""
+    counters = {"console": 0, "net": 0}
+
+    def guarded(fn):
+        def wrapper(*args):
+            try:
+                fn(*args)
+            except Exception:
+                pass
+        return wrapper
+
+    @guarded
+    def on_console(msg):
+        if msg.type in ("error", "warning") and counters["console"] < 200:
+            counters["console"] += 1
+            job_log(job_dir, f"[console.{msg.type}] {msg.text[:300]}", "WARNING")
+
+    @guarded
+    def on_response(resp):
+        req = resp.request
+        if req.resource_type not in ("xhr", "fetch", "document"):
+            return
+        counters["net"] += 1
+        n = counters["net"]
+        if n <= 40 or n % 25 == 0:
+            h = resp.headers
+            job_log(job_dir, f"[net #{n}] {resp.status} {req.method} {req.resource_type} "
+                             f"{resp.url.split('?')[0][:140]} len={h.get('content-length', '?')} "
+                             f"type={h.get('content-type', '?')[:40]}")
+
+    browser.on("disconnected", guarded(lambda *_: job_log(
+        job_dir, "!!! BROWSER DISCONNECTED: the Chromium process exited or crashed", "ERROR")))
+    page.on("crash", guarded(lambda *_: job_log(
+        job_dir, "!!! PAGE CRASHED: the renderer process died (usually out of memory)", "ERROR")))
+    page.on("close", guarded(lambda *_: job_log(job_dir, "[page] closed", "WARNING")))
+    page.on("console", on_console)
+    page.on("pageerror", guarded(lambda err: job_log(job_dir, f"[pageerror] {str(err)[:300]}", "WARNING")))
+    page.on("requestfailed", guarded(lambda r: job_log(
+        job_dir, f"[requestfailed] {r.method} {r.url[:150]} -> {r.failure}", "WARNING")))
+    page.on("response", on_response)
+    page.on("download", guarded(lambda d: job_log(
+        job_dir, f"[download event] file={d.suggested_filename} url={d.url[:150]}")))
+    page.on("popup", guarded(lambda p: job_log(job_dir, f"[popup] {p.url[:150]}", "WARNING")))
+
+
+def take_shot(page, job_dir: Path, name: str):
+    try:
+        page.screenshot(path=str(job_dir / f"{name}.png"), timeout=15000)
+        job_log(job_dir, f"Screenshot saved: {name}.png")
+    except Exception as exc:
+        job_log(job_dir, f"Screenshot {name} failed: {str(exc)[:150]}", "WARNING")
+
+
+# =====================================================================
 #  Playwright helpers
 # =====================================================================
 def launch_browser(pw, job_dir: Path, dl_dir: Path):
@@ -145,22 +423,33 @@ def launch_browser(pw, job_dir: Path, dl_dir: Path):
     1) system Chromium (Streamlit Cloud via packages.txt) if available,
     2) otherwise Playwright's own Chromium, installing it on first use.
     """
-    kwargs = dict(
-        headless=True,
-        downloads_path=str(dl_dir),
-        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--mute-audio"],
-    )
+    args = [
+        "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--mute-audio",
+        # fewer processes / less memory
+        "--renderer-process-limit=1", "--no-zygote",
+        "--disable-features=IsolateOrigins,site-per-process", "--disable-site-isolation-trials",
+        "--disable-extensions", "--disable-background-networking", "--disable-sync",
+        "--disable-component-update", "--disable-breakpad", "--metrics-recording-only", "--no-first-run",
+    ]
+    limit = cgroup_memory()["limit_mb"]
+    if limit:  # make a runaway page die inside Chromium (page crash) instead of OOM-killing the container
+        args.append(f"--js-flags=--max-old-space-size={int(max(256, limit * 0.45))}")
+
+    kwargs = dict(headless=True, downloads_path=str(dl_dir), args=args)
 
     system_chromium = shutil.which("chromium") or shutil.which("chromium-browser")
     if system_chromium:
         try:
-            job_log(job_dir, f"Using system Chromium: {system_chromium}")
-            return pw.chromium.launch(executable_path=system_chromium, **kwargs)
+            browser = pw.chromium.launch(executable_path=system_chromium, **kwargs)
+            job_log(job_dir, f"Using system Chromium {system_chromium} (version {browser.version})")
+            return browser
         except PWError as exc:
-            job_log(job_dir, f"System Chromium failed ({str(exc)[:200]}); trying Playwright's own.", "WARNING")
+            job_log(job_dir, f"System Chromium failed ({str(exc)[:300]}); trying Playwright's own.", "WARNING")
 
     try:
-        return pw.chromium.launch(**kwargs)
+        browser = pw.chromium.launch(**kwargs)
+        job_log(job_dir, f"Using Playwright Chromium (version {browser.version})")
+        return browser
     except PWError as exc:
         if "playwright install" not in str(exc) and "Executable doesn't exist" not in str(exc):
             raise
@@ -295,13 +584,6 @@ def pw_click_download_and_all_page(page):
     )
 
 
-def dir_biggest_file_mb(folder: Path) -> float:
-    try:
-        return max((p.stat().st_size for p in folder.rglob("*") if p.is_file()), default=0) / 1024 / 1024
-    except OSError:
-        return 0.0
-
-
 # =====================================================================
 #  STEP 1 worker – retrieve (download only, no processing)
 # =====================================================================
@@ -312,42 +594,38 @@ def retrieve_worker(job_dir: Path, username: str, password: str):
     shutil.rmtree(dl_dir, ignore_errors=True)
     dl_dir.mkdir(parents=True, exist_ok=True)
     part.unlink(missing_ok=True)
+    for old in job_dir.glob("shot_*.png"):
+        old.unlink(missing_ok=True)
 
-    stop_hb = threading.Event()
-
-    def heartbeat():
-        """Keeps the status fresh while Playwright blocks waiting for the big file."""
-        t0 = time.time()
-        while not stop_hb.wait(3):
-            if time.time() - t0 > DOWNLOAD_TIMEOUT * 2:
-                break
-            mins, secs = divmod(int(time.time() - t0), 60)
-            rep.running(
-                f"Waiting for the server to prepare/send the file... "
-                f"{mins}m {secs:02d}s elapsed, {dir_biggest_file_mb(dl_dir):.1f} MB received so far",
-                0.40, quiet=True,
-            )
-
+    monitor = None
+    original_name = None
     try:
+        log_system_info(job_dir)
         rep.running("Starting browser...", 0.05)
+        monitor = DiagnosticsMonitor(job_dir, dl_dir, rep)
+        monitor.start()
+
         with sync_playwright() as pw:
             browser = launch_browser(pw, job_dir, dl_dir)
             page = None
             try:
                 context = browser.new_context(accept_downloads=True, viewport={"width": 1600, "height": 900})
-                # save memory/bandwidth: don't load images or media
-                context.route(
-                    "**/*",
-                    lambda route: route.abort()
-                    if route.request.resource_type in ("image", "media")
-                    else route.continue_(),
-                )
+                if BLOCK_IMAGES:  # save memory/bandwidth: don't load images or media
+                    context.route(
+                        "**/*",
+                        lambda route: route.abort()
+                        if route.request.resource_type in ("image", "media")
+                        else route.continue_(),
+                    )
                 page = context.new_page()
                 page.set_default_timeout(DEFAULT_TIMEOUT * 1000)
+                attach_diagnostics(job_dir, browser, page)
 
+                monitor.phase = "login"
                 rep.running("Logging in...", 0.15)
                 pw_login(page, username, password)
 
+                monitor.phase = "alarm-page"
                 rep.running("Opening alarm page...", 0.25)
                 pw_open_alarm_page(page)
                 pw_scroll_to_alarm_section(page)
@@ -355,26 +633,53 @@ def retrieve_worker(job_dir: Path, username: str, password: str):
                 rep.running("Opening CLOSED ALARM tab...", 0.30)
                 pw_click_closed_alarm_tab(page)
 
+                # ---------------- export ----------------
+                job_log(job_dir, "=== BEFORE export click === " + format_snapshot(collect_snapshot(dl_dir)))
+                take_shot(page, job_dir, "shot_1_before_export")
+
+                holder = {}
+                page.on("download", lambda d: holder.setdefault("d", d))
+                monitor.phase = "export"
                 rep.running("Requesting full export (All Page)...", 0.35)
-                hb = threading.Thread(target=heartbeat, daemon=True)
-                hb.start()
-                try:
-                    with page.expect_download(timeout=DOWNLOAD_TIMEOUT * 1000) as dl_info:
-                        pw_click_download_and_all_page(page)
-                    download = dl_info.value
-                    job_log(job_dir, f"Download started: {download.suggested_filename}")
-                    download.save_as(str(part))  # blocks until the file is complete
-                    failure = download.failure()
-                    if failure:
-                        raise RuntimeError(f"Browser reported a download failure: {failure}")
-                finally:
-                    stop_hb.set()
-                    hb.join(timeout=5)
+                pw_click_download_and_all_page(page)
+
+                job_log(job_dir, "=== AFTER export click === " + format_snapshot(collect_snapshot(dl_dir)))
+                page.wait_for_timeout(2000)
+                take_shot(page, job_dir, "shot_2_after_export")
+                job_log(job_dir, "=== +2s after export click === " + format_snapshot(collect_snapshot(dl_dir)))
+
+                # wait for the download event, watching for crashes / memory guard the whole time
+                deadline = time.time() + DOWNLOAD_TIMEOUT
+                last_shot, extra_shots = time.time(), 0
+                while "d" not in holder:
+                    if monitor.tripped:
+                        raise RuntimeError(monitor.tripped)
+                    if not browser.is_connected():
+                        raise RuntimeError("Chromium exited unexpectedly while waiting for the export "
+                                           "(see the log lines above for memory and process state).")
+                    if page.is_closed():
+                        raise RuntimeError("The browser page closed or crashed while waiting for the export.")
+                    if time.time() > deadline:
+                        raise RuntimeError(f"No download started within {DOWNLOAD_TIMEOUT} seconds.")
+                    page.wait_for_timeout(1000)
+                    if extra_shots < 6 and time.time() - last_shot >= 60:
+                        extra_shots += 1
+                        last_shot = time.time()
+                        take_shot(page, job_dir, f"shot_3_waiting_{extra_shots}")
+
+                download = holder["d"]
                 original_name = download.suggested_filename
+                job_log(job_dir, f"Download started: {original_name}; saving (blocks until complete)...")
+                download.save_as(str(part))
+                failure = download.failure()
+                if failure:
+                    raise RuntimeError(f"Browser reported a download failure: {failure}")
+                job_log(job_dir, "=== DOWNLOAD COMPLETE === " + format_snapshot(collect_snapshot(dl_dir)))
             except Exception:
+                job_log(job_dir, "State at failure: " + format_snapshot(collect_snapshot(dl_dir)), "ERROR")
                 if page is not None:
                     try:
-                        page.screenshot(path=str(job_dir / "error.png"))
+                        page.screenshot(path=str(job_dir / "error.png"), timeout=10000)
                     except Exception:
                         pass
                 raise
@@ -393,10 +698,18 @@ def retrieve_worker(job_dir: Path, username: str, password: str):
         )
     except Exception as exc:
         job_log(job_dir, traceback.format_exc(), "ERROR")
-        message = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+        if monitor is not None and monitor.tripped:
+            message = monitor.tripped
+        else:
+            message = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
         rep.fail(message)
     finally:
-        stop_hb.set()
+        if monitor is not None:
+            monitor.phase = "finished"
+            monitor.stop()
+            job_log(job_dir, f"SUMMARY: peak container memory={monitor.peak_used:.0f}MB, "
+                             f"peak Chromium RSS={monitor.peak_chromium:.0f}MB, "
+                             f"memory guard tripped={'YES' if monitor.tripped else 'no'}")
         part.unlink(missing_ok=True)
         shutil.rmtree(dl_dir, ignore_errors=True)
 
@@ -689,10 +1002,15 @@ def render_workflow(job_dir: Path, job_id: str):
 
     # ------------------------------------------------------------ extras
     st.divider()
-    with st.expander("Activity log"):
+    with st.expander("Diagnostics (log, memory, screenshots)"):
         log_file = job_dir / "job.log"
-        lines = log_file.read_text(encoding="utf-8").splitlines()[-60:] if log_file.exists() else []
-        st.code("\n".join(lines) or "(empty)", language=None)
+        all_lines = log_file.read_text(encoding="utf-8").splitlines() if log_file.exists() else []
+        st.code("\n".join(all_lines[-150:]) or "(empty)", language=None)
+        if all_lines:
+            st.download_button("Download full log (job.log)", data="\n".join(all_lines),
+                               file_name=f"job_{job_id}.log", mime="text/plain", on_click="ignore", key="dl_log")
+        for shot in sorted(job_dir.glob("shot_*.png")):
+            st.image(str(shot), caption=shot.stem)
     if st.button("🗑️ Delete my files & start over", disabled=busy):
         shutil.rmtree(job_dir, ignore_errors=True)
         st.query_params.clear()
