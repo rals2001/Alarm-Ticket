@@ -1,8 +1,8 @@
 """
 PMT Alarm – Closed Alarm downloader (3-step workflow, Playwright edition)
 
-STEP 1  Retrieve Excel  -> login + download the raw XLSX only (background thread)
-STEP 2  Filter Excel    -> stream the raw XLSX, keep the chosen Year-Month (background thread)
+STEP 1  Retrieve Excel  -> login in Chromium, capture the export API call, download the data via requests
+STEP 2  Filter Excel    -> stream the API JSON, keep the chosen Year-Month, write XLSX
 STEP 3  Download Result -> hand the processed XLSX to the browser (no processing)
 
 All state lives on disk in a per-session job folder (not only in st.session_state),
@@ -21,11 +21,15 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import date, datetime
+from urllib.parse import urlparse
+from datetime import date, datetime, timedelta, timezone
+from itertools import chain, islice
 from pathlib import Path
 
 import streamlit as st
-from openpyxl import Workbook, load_workbook
+import ijson
+import requests
+from openpyxl import Workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.datetime import from_excel
@@ -43,7 +47,6 @@ LOGIN_URL = "https://pmt-alarm.komdigi.go.id/auth/login"
 ALARM_URL = "https://pmt-alarm.komdigi.go.id/dashboard/alarm"
 DOWNLOAD_TIMEOUT = 900        # seconds to wait for the big export (15 min)
 DEFAULT_TIMEOUT = 40          # seconds for normal waits
-DATE_COLUMN_NAME = "Data Created"
 JOBS_ROOT = Path(tempfile.gettempdir()) / "pmt_alarm_jobs"
 STALE_AFTER = 300             # a "running" step with no heartbeat for 5 min = interrupted
 JOB_MAX_AGE_HOURS = 12
@@ -52,6 +55,15 @@ MEM_GUARD_FRACTION = 0.85     # kill Chromium when the container reaches 85 % of
 MEM_LIMIT_MB_OVERRIDE = float(os.environ.get("MEM_LIMIT_MB", 0)) or None  # force a limit if auto-detect fails
 MONITOR_INTERVAL = 2          # seconds between diagnostic samples
 BLOCK_IMAGES = True           # set False to test whether request interception matters
+
+# ---- PMT API (discovered from the captured network log) ----
+API_HOST = "pmt-api.komdigi.go.id"
+# the request fired by Export > All Page:  POST https://pmt-api.komdigi.go.id/api/v2/en/alarm
+API_EXPORT_URL_RE = re.compile(r"^https://pmt-api\.komdigi\.go\.id/api/v\d+/[^/]+/alarm/?(\?.*)?$")
+API_DATE_FIELD = None         # e.g. "created_at". None = auto-detect (see Diagnostics after Step 1)
+API_RECORDS_PATH = None       # e.g. "data.item". None = auto-detect
+COLUMN_LABELS = {}            # e.g. {"created_at": "Data Created"} to rename Excel headers
+SITE_UTC_OFFSET_HOURS = 7     # month boundaries are evaluated in WIB (UTC+7)
 MONTHS = [
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
@@ -139,7 +151,7 @@ def cleanup_old_jobs():
 
 
 def source_path(job_dir: Path) -> Path:
-    return job_dir / "source.xlsx"
+    return job_dir / "source.json"
 
 
 def source_ready(job_dir: Path) -> bool:
@@ -339,13 +351,13 @@ class DiagnosticsMonitor(threading.Thread):
             self._last_logged, self._last_used = now, used
             job_log(self.job_dir, f"MON +{int(elapsed)}s [{self.phase}] {format_snapshot(s)}")
 
-        if self.phase == "export" and not self.tripped:
+        if self.phase == "api-download" and not self.tripped:
             mins, secs = divmod(int(elapsed), 60)
             lim = f"/{s['limit']:.0f}" if s["limit"] else ""
             self.rep.running(
-                f"Waiting for the server to prepare/send the file... {mins}m {secs:02d}s elapsed, "
+                f"Downloading data from the API (server may take several minutes to respond)... {mins}m {secs:02d}s elapsed, "
                 f"{s['dl_mb']:.1f} MB received · memory {used:.0f}{lim} MB",
-                0.40, quiet=True,
+                0.50, quiet=True,
             )
 
         limit = s["limit"]
@@ -381,7 +393,7 @@ def attach_diagnostics(job_dir: Path, browser, page):
     @guarded
     def on_response(resp):
         req = resp.request
-        if req.resource_type not in ("xhr", "fetch", "document"):
+        if req.resource_type not in ("xhr", "fetch", "document") or API_HOST in resp.url:
             return
         counters["net"] += 1
         n = counters["net"]
@@ -563,7 +575,7 @@ def pw_click_closed_alarm_tab(page):
     page.wait_for_timeout(1000)
 
 
-def pw_click_download_and_all_page(page):
+def pw_open_download_menu(page):
     click_first(
         page,
         [
@@ -573,6 +585,9 @@ def pw_click_download_and_all_page(page):
         ],
         "Download Alarm button",
     )
+
+
+def pw_click_all_page(page):
     click_first(
         page,
         [
@@ -585,32 +600,295 @@ def pw_click_download_and_all_page(page):
 
 
 # =====================================================================
-#  STEP 1 worker – retrieve (download only, no processing)
+#  API discovery + capture (replaces the browser export)
+# =====================================================================
+SENSITIVE_RE = re.compile(r"pass|pwd|secret|otp|token", re.I)
+
+
+def redact_headers(headers: dict) -> dict:
+    out = {}
+    for k, v in headers.items():
+        lk, v = k.lower(), str(v)
+        if lk in ("authorization", "cookie", "proxy-authorization") or "token" in lk or "api-key" in lk:
+            out[k] = f"{v[:12]}…(len {len(v)})"
+        else:
+            out[k] = v[:150]
+    return out
+
+
+def redact_payload(body) -> str:
+    if not body:
+        return ""
+    text = body.decode("utf-8", "replace") if isinstance(body, (bytes, bytearray)) else str(body)
+
+    def red(o):
+        if isinstance(o, dict):
+            return {k: ("***" if SENSITIVE_RE.search(str(k)) else red(v)) for k, v in o.items()}
+        if isinstance(o, list):
+            return [red(x) for x in o[:20]]
+        return o
+
+    try:
+        return json.dumps(red(json.loads(text)), ensure_ascii=False)[:1500]
+    except ValueError:
+        return re.sub(r"(?i)([^&=]*(?:pass|pwd|secret|token|otp)[^&=]*=)[^&]*", r"\1***", text)[:1500]
+
+
+def find_records_path(obj, max_depth=6):
+    """Return (path, records): the biggest list of dicts inside a JSON document."""
+    best = ([], [])
+
+    def walk(o, path, depth):
+        nonlocal best
+        if depth > max_depth:
+            return
+        if isinstance(o, list):
+            if o and isinstance(o[0], dict) and len(o) > len(best[1]):
+                best = (list(path), o)
+        elif isinstance(o, dict):
+            for k, v in o.items():
+                walk(v, path + [str(k)], depth + 1)
+
+    walk(obj, [], 0)
+    return best
+
+
+def prefix_from_path(path) -> str:
+    return ".".join(list(path) + ["item"])
+
+
+def describe_json(obj) -> dict:
+    info = {"type": type(obj).__name__}
+    if isinstance(obj, dict):
+        info["top_keys"] = list(obj.keys())[:30]
+        info["nested_keys"] = {k: list(v.keys())[:15] for k, v in list(obj.items())[:10] if isinstance(v, dict)}
+    path, recs = find_records_path(obj)
+    if recs:
+        first = recs[0]
+        info["records_path"] = ".".join(path) or "(root list)"
+        info["records_in_response"] = len(recs)
+        info["fields"] = list(first.keys())[:80]
+        info["sample_record"] = {k: str(v)[:40] for k, v in list(first.items())[:80]}
+    return info
+
+
+def url_key(url: str) -> str:
+    return url.split("?")[0]
+
+
+class ApiCapture:
+    """
+    Records the site's API traffic (redacted) and, once armed, CAPTURES the export request and
+    ABORTS it inside the browser so Chromium never receives (or renders) the huge response.
+    The real headers/body are kept in memory only, never written to disk or logs.
+    """
+
+    def __init__(self, job_dir: Path):
+        self.job_dir = job_dir
+        self.export_armed = False
+        self.export_requests = []   # real data, in memory only
+        self.calls = []             # redacted, saved to api_capture.json
+        self.structures = {}        # url_key -> {"prefix":..., "describe":...}
+        self.login = None
+        self.last_listing = None
+        self._n = 0
+
+    # ---- wiring
+    def attach(self, page):
+        page.route(API_EXPORT_URL_RE, self._on_route)
+        page.on("request", self._guard(self._on_request))
+        page.on("response", self._guard(self._on_response))
+
+    @staticmethod
+    def _guard(fn):
+        def wrapper(*args):
+            try:
+                fn(*args)
+            except Exception as exc:
+                log.debug("api-capture handler error: %s", exc)
+        return wrapper
+
+    def _record(self, kind, req, body):
+        rec = {
+            "kind": kind, "method": req.method, "url": req.url, "resource_type": req.resource_type,
+            "headers": redact_headers(req.headers), "payload": redact_payload(body),
+            "payload_bytes": len(body) if body else 0,
+        }
+        if len(self.calls) < 150:
+            self.calls.append(rec)
+        return rec
+
+    # ---- handlers
+    def _on_route(self, route, *_):
+        req = route.request
+        if self.export_armed:
+            body = req.post_data_buffer
+            self.export_requests.append(
+                {"method": req.method, "url": req.url, "headers": dict(req.headers), "body": body}
+            )
+            rec = self._record("EXPORT", req, body)
+            job_log(self.job_dir, f"[EXPORT-REQUEST CAPTURED] {req.method} {url_key(req.url)} "
+                                  f"payload_bytes={rec['payload_bytes']} payload={rec['payload'][:600]} "
+                                  f"headers={list(rec['headers'].keys())}")
+            route.abort()  # Chromium must NOT process the multi-hundred-MB response
+        else:
+            route.fallback()
+
+    def _on_request(self, req):
+        if API_HOST not in req.url or req.resource_type not in ("xhr", "fetch"):
+            return
+        if self.export_armed and API_EXPORT_URL_RE.match(req.url):
+            return  # logged by _on_route
+        body = req.post_data_buffer if req.method.upper() != "GET" else None
+        self._n += 1
+        rec = self._record("api", req, body)
+        if API_EXPORT_URL_RE.match(req.url):
+            self.last_listing = rec
+        if re.search(r"login|signin|sign-in|auth|token", req.url, re.I) and req.method.upper() == "POST":
+            self.login = rec
+        if self._n <= 60:
+            job_log(self.job_dir, f"[api-req #{self._n}] {req.method} {url_key(req.url)} "
+                                  f"auth={'yes' if 'authorization' in req.headers else 'no'} "
+                                  f"payload={rec['payload'][:300]}")
+
+    def _on_response(self, resp):
+        req = resp.request
+        if API_HOST not in resp.url or req.resource_type not in ("xhr", "fetch"):
+            return
+        ctype = resp.headers.get("content-type", "")
+        length = int(resp.headers.get("content-length", "0") or 0)
+        job_log(self.job_dir, f"[api-resp] {resp.status} {req.method} {url_key(resp.url)} "
+                              f"type={ctype[:30]} len={length}")
+        if "json" in ctype and length < 2_000_000 and len(self.structures) < 15:
+            data = json.loads(resp.body())
+            info = describe_json(data)
+            path, recs = find_records_path(data)
+            entry = {"describe": info, "prefix": prefix_from_path(path) if recs else None}
+            self.structures.setdefault(url_key(resp.url), entry)
+            if self.login is not None and req.url == self.login["url"]:
+                entry["describe"].pop("sample_record", None)  # never keep login response values
+            job_log(self.job_dir, f"[api-struct] {url_key(resp.url)} top_keys={info.get('top_keys')} "
+                                  f"records_path={info.get('records_path')} "
+                                  f"records={info.get('records_in_response')} fields={info.get('fields')}")
+
+    # ---- output
+    def save(self):
+        out = {
+            "login_request": self.login,
+            "listing_request_before_export": self.last_listing,
+            "export_request": next((c for c in self.calls if c["kind"] == "EXPORT"), None),
+            "structures": self.structures,
+            "all_calls": self.calls,
+        }
+        (self.job_dir / "api_capture.json").write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+# =====================================================================
+#  Direct API download (no browser)
+# =====================================================================
+DROP_HEADERS = {"host", "content-length", "connection", "accept-encoding", "cookie",
+                "transfer-encoding", "keep-alive", "upgrade-insecure-requests"}
+
+
+def build_replay_headers(export: dict) -> dict:
+    headers = {k: v for k, v in export["headers"].items()
+               if k.lower() not in DROP_HEADERS and not k.startswith(":") and not k.lower().startswith("sec-")}
+    present = {k.lower() for k in headers}
+    origin = "{0.scheme}://{0.netloc}".format(urlparse(ALARM_URL))
+    if "user-agent" not in present:
+        headers["User-Agent"] = export.get("user_agent") or "Mozilla/5.0 (X11; Linux x86_64) Chrome/124.0 Safari/537.36"
+    if "origin" not in present:
+        headers["Origin"] = origin
+    if "referer" not in present:
+        headers["Referer"] = ALARM_URL
+    headers["Accept-Encoding"] = "gzip, deflate"
+    cookies = export.get("cookies") or []
+    if cookies:
+        headers["Cookie"] = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+    return headers
+
+
+def download_via_api(job_dir: Path, export: dict, dest: Path, monitor) -> int:
+    """Replay the captured export request with `requests` and stream the body to disk."""
+    headers = build_replay_headers(export)
+    job_log(job_dir, f"API replay: {export['method']} {url_key(export['url'])} "
+                     f"headers={redact_headers(headers)} body_bytes={len(export['body'] or b'')}")
+    with requests.Session() as sess:
+        resp = sess.request(
+            export["method"], export["url"], headers=headers, data=export["body"],
+            stream=True, timeout=(30, DOWNLOAD_TIMEOUT),
+        )
+        job_log(job_dir, f"API replay response: HTTP {resp.status_code} "
+                         f"type={resp.headers.get('content-type')} length={resp.headers.get('content-length')} "
+                         f"encoding={resp.headers.get('content-encoding')}")
+        if resp.status_code >= 400:
+            snippet = next(resp.iter_content(1024), b"")[:300].decode("utf-8", "replace")
+            hint = (" The token/cookie captured from the browser was not accepted; "
+                    "see api_capture.json for the headers that were sent."
+                    if resp.status_code in (401, 403) else "")
+            raise RuntimeError(f"API rejected the export request (HTTP {resp.status_code}): {snippet}{hint}")
+
+        written, first = 0, b""
+        with open(dest, "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                if monitor is not None and monitor.tripped:
+                    raise RuntimeError(monitor.tripped)
+                if not chunk:
+                    continue
+                if not first:
+                    first = chunk[:200]
+                fh.write(chunk)
+                written += len(chunk)
+
+    if not first.lstrip(b"\xef\xbb\xbf \r\n\t")[:1] in (b"{", b"["):
+        raise RuntimeError("The API did not return JSON. First bytes: "
+                           f"{first[:120]!r} (content-type {resp.headers.get('content-type')}).")
+    return written
+
+
+def detect_prefix_from_file(path: Path):
+    """Fallback: first array of objects found while streaming the file."""
+    last_array = None
+    with open(path, "rb") as fh:
+        for i, (prefix, event, _value) in enumerate(ijson.parse(fh)):
+            if event == "start_array":
+                last_array = prefix
+            elif event == "start_map" and last_array is not None and prefix == (f"{last_array}.item" if last_array else "item"):
+                return prefix
+            elif i > 3_000_000:
+                break
+    return None
+
+
+# =====================================================================
+#  STEP 1 worker – capture the export request, then download via API
 # =====================================================================
 def retrieve_worker(job_dir: Path, username: str, password: str):
     rep = StepReporter(job_dir, 1)
     dl_dir = job_dir / "dl"
-    part = job_dir / "source.xlsx.part"
+    part = dl_dir / "alarm_export.json.part"
     shutil.rmtree(dl_dir, ignore_errors=True)
     dl_dir.mkdir(parents=True, exist_ok=True)
-    part.unlink(missing_ok=True)
-    for old in job_dir.glob("shot_*.png"):
-        old.unlink(missing_ok=True)
+    for pattern in ("shot_*.png", "api_capture.json", "source_meta.json"):
+        for old in job_dir.glob(pattern):
+            old.unlink(missing_ok=True)
 
     monitor = None
-    original_name = None
+    export = None
+    capture = ApiCapture(job_dir)
     try:
         log_system_info(job_dir)
         rep.running("Starting browser...", 0.05)
         monitor = DiagnosticsMonitor(job_dir, dl_dir, rep)
         monitor.start()
 
+        # ---------------- browser: login + capture only ----------------
         with sync_playwright() as pw:
             browser = launch_browser(pw, job_dir, dl_dir)
             page = None
             try:
-                context = browser.new_context(accept_downloads=True, viewport={"width": 1600, "height": 900})
-                if BLOCK_IMAGES:  # save memory/bandwidth: don't load images or media
+                context = browser.new_context(accept_downloads=False, viewport={"width": 1600, "height": 900})
+                if BLOCK_IMAGES:
                     context.route(
                         "**/*",
                         lambda route: route.abort()
@@ -620,6 +898,7 @@ def retrieve_worker(job_dir: Path, username: str, password: str):
                 page = context.new_page()
                 page.set_default_timeout(DEFAULT_TIMEOUT * 1000)
                 attach_diagnostics(job_dir, browser, page)
+                capture.attach(page)
 
                 monitor.phase = "login"
                 rep.running("Logging in...", 0.15)
@@ -632,49 +911,33 @@ def retrieve_worker(job_dir: Path, username: str, password: str):
 
                 rep.running("Opening CLOSED ALARM tab...", 0.30)
                 pw_click_closed_alarm_tab(page)
-
-                # ---------------- export ----------------
                 job_log(job_dir, "=== BEFORE export click === " + format_snapshot(collect_snapshot(dl_dir)))
                 take_shot(page, job_dir, "shot_1_before_export")
 
-                holder = {}
-                page.on("download", lambda d: holder.setdefault("d", d))
-                monitor.phase = "export"
-                rep.running("Requesting full export (All Page)...", 0.35)
-                pw_click_download_and_all_page(page)
+                monitor.phase = "capture"
+                rep.running("Capturing the export API request (the heavy browser export is blocked)...", 0.35)
+                pw_open_download_menu(page)
+                capture.export_armed = True       # from now on the alarm API call is captured + aborted
+                pw_click_all_page(page)
 
-                job_log(job_dir, "=== AFTER export click === " + format_snapshot(collect_snapshot(dl_dir)))
-                page.wait_for_timeout(2000)
+                end = time.time() + 60
+                while not capture.export_requests and time.time() < end:
+                    if not browser.is_connected() or page.is_closed():
+                        raise RuntimeError("Chromium exited while capturing the export request.")
+                    page.wait_for_timeout(500)
+                if not capture.export_requests:
+                    raise RuntimeError("Clicking Export > All Page did not send a request to the alarm API. "
+                                       "Check the [api-req] lines and api_capture.json in Diagnostics.")
+                page.wait_for_timeout(1500)  # collect any additional calls triggered by the click
+                job_log(job_dir, f"Captured {len(capture.export_requests)} export request(s); using the first one.")
+                export = capture.export_requests[0]
+                export["cookies"] = context.cookies([export["url"]])
+                try:
+                    export["user_agent"] = page.evaluate("navigator.userAgent").replace("HeadlessChrome", "Chrome")
+                except Exception:
+                    export["user_agent"] = None
                 take_shot(page, job_dir, "shot_2_after_export")
-                job_log(job_dir, "=== +2s after export click === " + format_snapshot(collect_snapshot(dl_dir)))
-
-                # wait for the download event, watching for crashes / memory guard the whole time
-                deadline = time.time() + DOWNLOAD_TIMEOUT
-                last_shot, extra_shots = time.time(), 0
-                while "d" not in holder:
-                    if monitor.tripped:
-                        raise RuntimeError(monitor.tripped)
-                    if not browser.is_connected():
-                        raise RuntimeError("Chromium exited unexpectedly while waiting for the export "
-                                           "(see the log lines above for memory and process state).")
-                    if page.is_closed():
-                        raise RuntimeError("The browser page closed or crashed while waiting for the export.")
-                    if time.time() > deadline:
-                        raise RuntimeError(f"No download started within {DOWNLOAD_TIMEOUT} seconds.")
-                    page.wait_for_timeout(1000)
-                    if extra_shots < 6 and time.time() - last_shot >= 60:
-                        extra_shots += 1
-                        last_shot = time.time()
-                        take_shot(page, job_dir, f"shot_3_waiting_{extra_shots}")
-
-                download = holder["d"]
-                original_name = download.suggested_filename
-                job_log(job_dir, f"Download started: {original_name}; saving (blocks until complete)...")
-                download.save_as(str(part))
-                failure = download.failure()
-                if failure:
-                    raise RuntimeError(f"Browser reported a download failure: {failure}")
-                job_log(job_dir, "=== DOWNLOAD COMPLETE === " + format_snapshot(collect_snapshot(dl_dir)))
+                job_log(job_dir, "=== AFTER capture === " + format_snapshot(collect_snapshot(dl_dir)))
             except Exception:
                 job_log(job_dir, "State at failure: " + format_snapshot(collect_snapshot(dl_dir)), "ERROR")
                 if page is not None:
@@ -684,18 +947,34 @@ def retrieve_worker(job_dir: Path, username: str, password: str):
                         pass
                 raise
             finally:
+                capture.save()
                 try:
-                    browser.close()  # free memory before Step 2
+                    browser.close()
                 except Exception:
                     pass
 
+        # ---------------- no browser from here on ----------------
+        job_log(job_dir, "=== BROWSER CLOSED === " + format_snapshot(collect_snapshot(dl_dir)))
+        monitor.phase = "api-download"
+        rep.running("Browser closed. Downloading the data directly from the API...", 0.45)
+        written = download_via_api(job_dir, export, part, monitor)
+        export = None  # drop credentials from memory
+        job_log(job_dir, f"API download finished: {written / 1048576:.1f} MB (decompressed JSON)")
+
+        capture_url = capture_export_url(capture)
+        structure = capture.structures.get(url_key(capture_url))
+        prefix = API_RECORDS_PATH or (structure or {}).get("prefix") or detect_prefix_from_file(part)
+        if not prefix:
+            raise RuntimeError("Could not find the list of alarm records inside the API response. "
+                               "See api_capture.json and set API_RECORDS_PATH.")
+        job_log(job_dir, f"Records path: {prefix}")
+
+        (job_dir / "source_meta.json").write_text(
+            json.dumps({"records_prefix": prefix, "export_url": url_key(capture_url), "bytes": written}), encoding="utf-8")
         os.replace(part, source_path(job_dir))
         size_mb = source_path(job_dir).stat().st_size / 1024 / 1024
-        rep.done(
-            f"Download complete: {size_mb:.1f} MB saved on the server.",
-            size_mb=round(size_mb, 1),
-            original_name=original_name,
-        )
+        rep.done(f"Download complete: {size_mb:.1f} MB of alarm data saved on the server.",
+                 size_mb=round(size_mb, 1), records_prefix=prefix)
     except Exception as exc:
         job_log(job_dir, traceback.format_exc(), "ERROR")
         if monitor is not None and monitor.tripped:
@@ -710,34 +989,50 @@ def retrieve_worker(job_dir: Path, username: str, password: str):
             job_log(job_dir, f"SUMMARY: peak container memory={monitor.peak_used:.0f}MB, "
                              f"peak Chromium RSS={monitor.peak_chromium:.0f}MB, "
                              f"memory guard tripped={'YES' if monitor.tripped else 'no'}")
-        part.unlink(missing_ok=True)
         shutil.rmtree(dl_dir, ignore_errors=True)
 
 
+def capture_export_url(capture: ApiCapture) -> str:
+    for c in capture.calls:
+        if c["kind"] == "EXPORT":
+            return c["url"]
+    return ""
+
+
 # =====================================================================
-#  STEP 2 worker – streaming filter (low memory)
+#  STEP 2 worker – streaming filter of the API JSON (low memory)
 # =====================================================================
+WIB = timezone(timedelta(hours=SITE_UTC_OFFSET_HOURS))
+MAX_COLUMNS = 150
 _DATE_FORMATS = [
     "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
     "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M", "%d/%m/%Y", "%d-%m-%Y",
 ]
 
 
+def _to_site_time(dt: datetime) -> datetime:
+    return dt.astimezone(WIB).replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+
 class DateParser:
-    """Fast row-by-row date parsing; remembers the format that worked."""
+    """Row-by-row date parsing: ISO (with timezone), epoch s/ms, Excel serials, d/m/Y text."""
 
     def __init__(self):
         self.fmt = None
 
     def __call__(self, value):
-        if value is None:
+        if value is None or isinstance(value, bool):
             return None
         if isinstance(value, datetime):
-            return value
+            return _to_site_time(value)
         if isinstance(value, date):
             return datetime(value.year, value.month, value.day)
         if isinstance(value, (int, float)):
             try:
+                if value > 1e11:
+                    return datetime.fromtimestamp(value / 1000, tz=WIB).replace(tzinfo=None)
+                if value > 1e8:
+                    return datetime.fromtimestamp(value, tz=WIB).replace(tzinfo=None)
                 return from_excel(value)
             except Exception:
                 return None
@@ -749,6 +1044,11 @@ class DateParser:
                 return datetime.strptime(s, self.fmt)
             except ValueError:
                 pass
+        if "T" in s or s.endswith("Z"):
+            try:
+                return _to_site_time(datetime.fromisoformat(s.replace("Z", "+00:00")))
+            except ValueError:
+                pass
         for fmt in _DATE_FORMATS:
             try:
                 parsed = datetime.strptime(s, fmt)
@@ -756,7 +1056,7 @@ class DateParser:
                 return parsed
             except ValueError:
                 continue
-        try:  # rare formats
+        try:
             import pandas as pd
 
             iso = len(s) >= 5 and s[:4].isdigit() and s[4] in "-/"
@@ -770,69 +1070,91 @@ def _clean(v):
     return ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v
 
 
-def stream_filter(src: Path, dst: Path, year: int, month: int, on_progress):
+def flatten(rec: dict, parent: str = "", out: dict = None) -> dict:
+    if out is None:
+        out = {}
+    for k, v in rec.items():
+        key = f"{parent}.{k}" if parent else str(k)
+        if isinstance(v, dict):
+            flatten(v, key, out)
+        elif isinstance(v, list):
+            out[key] = json.dumps(v, ensure_ascii=False)
+        else:
+            out[key] = v
+    return out
+
+
+_PREFERRED_DATE_FIELDS = ["created_at", "createdat", "date_created", "data_created", "created", "created_date",
+                          "createddate", "datetime_created", "create_at", "created_time"]
+
+
+def pick_date_field(columns, sample_rows, parser):
+    if API_DATE_FIELD:
+        if API_DATE_FIELD not in columns:
+            raise RuntimeError(f"API_DATE_FIELD '{API_DATE_FIELD}' not found. Available fields: {columns[:60]}")
+        return API_DATE_FIELD
+    lower = {c: c.lower().replace(" ", "_") for c in columns}
+    ordered = [c for pref in _PREFERRED_DATE_FIELDS for c in columns if lower[c].split(".")[-1] == pref]
+    ordered += [c for c in columns if "creat" in lower[c] and c not in ordered]
+    ordered += [c for c in columns if any(t in lower[c] for t in ("date", "time", "_at")) and c not in ordered]
+    for col in ordered:
+        vals = [r.get(col) for r in sample_rows if r.get(col) not in (None, "")][:200]
+        if vals and sum(parser(v) is not None for v in vals) / len(vals) >= 0.8:
+            return col
+    raise RuntimeError("Could not detect the creation-date field automatically. "
+                       f"Set API_DATE_FIELD at the top of app.py. Available fields: {columns[:60]}")
+
+
+def stream_filter_json(src: Path, dst: Path, year: int, month: int, prefix: str, on_progress):
     """
-    Read `src` row by row (openpyxl read-only) and write matching rows straight to `dst`
-    (openpyxl write-only). Memory stays small no matter how big the file is.
-    Returns dict(total, kept, invalid, date_col).
+    Stream records from the API JSON (ijson) -> keep the chosen Year-Month -> write XLSX row by row.
+    Memory stays small even if the JSON is hundreds of MB.
     """
     parser = DateParser()
-    wb = load_workbook(src, read_only=True, data_only=True)
-    try:
-        ws = wb.worksheets[0]
-        try:
-            est_total = ws.max_row  # from the sheet header; may be None / approximate
-        except Exception:
-            est_total = None
+    with open(src, "rb") as fh:
+        records = ijson.items(fh, prefix, use_float=True)
+        head = [flatten(r) for r in islice(records, 500)]
+        if not head:
+            raise RuntimeError(f"No records found at path '{prefix}' in the downloaded JSON.")
 
-        rows = ws.iter_rows(values_only=True)
-        header = next(rows, None)
-        if not header or all(h is None for h in header):
-            raise RuntimeError("The downloaded Excel file is empty or has no header row.")
-        ncols = max(i for i, h in enumerate(header) if h is not None) + 1
-        header = list(header[:ncols])
-
-        normalized = {str(h).strip().lower(): i for i, h in enumerate(header) if h is not None}
-        date_idx = None
-        for cand in (DATE_COLUMN_NAME.lower(), "date created", "data created"):
-            if cand in normalized:
-                date_idx = normalized[cand]
-                break
-        if date_idx is None:
-            date_idx = ncols - 1  # fall back to the LAST column
-        date_col = str(header[date_idx])
+        columns, seen = [], set()
+        for row in head:
+            for key in row:
+                if key not in seen:
+                    seen.add(key)
+                    columns.append(key)
+        columns = columns[:MAX_COLUMNS]
+        date_field = pick_date_field(columns, head, parser)
+        date_idx = columns.index(date_field)
+        job_log_hint = f"columns={len(columns)} date_field={date_field}"
 
         wb_out = Workbook(write_only=True)
         ws_out = wb_out.create_sheet("Closed Alarm")
         ws_out.freeze_panes = "A2"
-        for i, h in enumerate(header, start=1):
-            ws_out.column_dimensions[get_column_letter(i)].width = min(max(len(str(h or "")) + 4, 14), 40)
-        ws_out.append([_clean(h) for h in header])
+        labels = [COLUMN_LABELS.get(c, c) for c in columns]
+        for i, label in enumerate(labels, start=1):
+            ws_out.column_dimensions[get_column_letter(i)].width = min(max(len(label) + 4, 14), 40)
+        ws_out.append(labels)
 
         total = kept = invalid = 0
         last_report = time.time()
-        for row in rows:
-            if not any(v is not None for v in row):
-                continue  # blank row
+        all_rows = chain(head, (flatten(r) for r in records))
+        for flat in all_rows:
             total += 1
-            if len(row) < ncols:
-                row = tuple(row) + (None,) * (ncols - len(row))
-            dt = parser(row[date_idx])
+            dt = parser(flat.get(date_field))
             if dt is None:
                 invalid += 1
             elif dt.year == year and dt.month == month:
-                out = [_clean(v) for v in row[:ncols]]
-                out[date_idx] = dt
-                ws_out.append(out)
+                row = [_clean(flat.get(c)) for c in columns]
+                row[date_idx] = dt
+                ws_out.append(row)
                 kept += 1
             if total % 2000 == 0 and time.time() - last_report >= 2:
                 last_report = time.time()
-                on_progress(total, est_total, kept)
+                on_progress(total, kept)
 
         wb_out.save(dst)
-        return {"total": total, "kept": kept, "invalid": invalid, "date_col": date_col}
-    finally:
-        wb.close()
+    return {"total": total, "kept": kept, "invalid": invalid, "date_col": date_field, "info": job_log_hint}
 
 
 def filter_worker(job_dir: Path, year: int, month: int):
@@ -840,30 +1162,28 @@ def filter_worker(job_dir: Path, year: int, month: int):
     label = f"{MONTHS[month - 1]} {year}"
     part = job_dir / "result.part"
     try:
-        src = source_path(job_dir)
         if not source_ready(job_dir):
-            raise RuntimeError("Source Excel not found. Run Step 1 first.")
+            raise RuntimeError("Source data not found. Run Step 1 first.")
+        meta = json.loads((job_dir / "source_meta.json").read_text(encoding="utf-8"))
 
         for old in job_dir.glob("result_*.xlsx"):
             old.unlink(missing_ok=True)
 
-        rep.running(f"Reading source file and filtering for {label}...", 0.02)
+        rep.running(f"Reading source data and filtering for {label}...", None)
 
-        def progress(total, est, kept):
-            frac = min(total / est, 0.98) if est and est > 0 else None
-            rep.running(f"Filtering {label}: {total:,} rows scanned, {kept:,} kept so far...", frac, quiet=True)
+        def progress(total, kept):
+            rep.running(f"Filtering {label}: {total:,} records scanned, {kept:,} kept so far...", None, quiet=True)
 
-        stats = stream_filter(src, part, year, month, progress)
+        stats = stream_filter_json(source_path(job_dir), part, year, month, meta["records_prefix"], progress)
+        job_log(job_dir, f"[step 2] {stats['info']}")
 
         result_name = f"result_{year}-{month:02d}.xlsx"
         os.replace(part, job_dir / result_name)
+        stats.pop("info", None)
         rep.done(
-            f"Filtering complete for {label}: {stats['kept']:,} of {stats['total']:,} rows kept.",
-            result_file=result_name,
-            label=label,
-            year=year,
-            month=month,
-            **stats,
+            f"Filtering complete for {label}: {stats['kept']:,} of {stats['total']:,} records kept "
+            f"(date field: {stats['date_col']}).",
+            result_file=result_name, label=label, year=year, month=month, **stats,
         )
     except Exception as exc:
         job_log(job_dir, traceback.format_exc(), "ERROR")
@@ -919,10 +1239,11 @@ def render_workflow(job_dir: Path, job_id: str):
 
     # ------------------------------------------------------------ STEP 1
     st.subheader("Step 1 · Retrieve Excel")
-    st.caption("Logs in and downloads the full Closed Alarm export. No filtering happens here.")
+    st.caption("Logs in, captures the Export API request (the heavy in-browser export is blocked), then downloads "
+               "the data directly from the PMT API. No filtering happens here.")
     if src_ok and s1["state"] != "running":
         size_mb = source_path(job_dir).stat().st_size / 1024 / 1024
-        st.success(f"✅ Source file is ready on the server ({size_mb:.1f} MB). No need to download again.")
+        st.success(f"✅ Source data is ready on the server ({size_mb:.1f} MB). No need to download again.")
     show_status(s1 if s1["state"] in ("running", "error") else {"state": "idle"})
     if s1["state"] == "error" and (job_dir / "error.png").exists():
         st.image(str(job_dir / "error.png"), caption="Browser screenshot when the error happened")
@@ -935,7 +1256,7 @@ def render_workflow(job_dir: Path, job_id: str):
 
     if go1:
         if src_ok and not force:
-            st.info("The source file already exists, so the download was skipped. "
+            st.info("The source data already exists, so the download was skipped. "
                     "Tick “Replace the existing file” to download a new copy.")
         elif not username or not password:
             st.error("Please enter both username and password.")
@@ -955,7 +1276,7 @@ def render_workflow(job_dir: Path, job_id: str):
 
     # ------------------------------------------------------------ STEP 2
     st.subheader("Step 2 · Filter Excel")
-    st.caption("Streams the downloaded file and keeps only the chosen Year-Month. Nothing is downloaded here.")
+    st.caption("Streams the downloaded data and keeps only the chosen Year-Month, then builds the Excel file. Nothing is downloaded here.")
     ready2 = src_ok and s1["state"] != "running"
 
     now = datetime.now()
@@ -1009,6 +1330,10 @@ def render_workflow(job_dir: Path, job_id: str):
         if all_lines:
             st.download_button("Download full log (job.log)", data="\n".join(all_lines),
                                file_name=f"job_{job_id}.log", mime="text/plain", on_click="ignore", key="dl_log")
+        cap_file = job_dir / "api_capture.json"
+        if cap_file.exists():
+            st.download_button("Download api_capture.json (redacted API discovery)", data=cap_file.read_bytes(),
+                               file_name="api_capture.json", mime="application/json", on_click="ignore", key="dl_cap")
         for shot in sorted(job_dir.glob("shot_*.png")):
             st.image(str(shot), caption=shot.stem)
     if st.button("🗑️ Delete my files & start over", disabled=busy):
