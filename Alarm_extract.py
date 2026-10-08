@@ -525,17 +525,43 @@ def pw_open_alarm_page(page):
     page.wait_for_timeout(2000)
 
 
+CLOSED_TAB_XPATHS = [
+    "xpath=//*[(self::button or self::a or self::li or self::div or self::span or @role='tab')]"
+    "[normalize-space()='CLOSED ALARM' or normalize-space()='Closed Alarm']",
+    f"xpath=//*[contains({UPPER}, 'CLOSED ALARM') and (self::button or self::a or @role='tab' or self::li)]",
+]
+
+
+def _closed_tab_visible(page) -> bool:
+    for sel in CLOSED_TAB_XPATHS:
+        try:
+            loc = page.locator(sel)
+            for i in range(loc.count()):
+                if loc.nth(i).is_visible():
+                    return True
+        except PWError:
+            pass
+    return False
+
+
 def pw_scroll_to_alarm_section(page):
+    """Scroll down the dashboard (past Daily Analytics) until the ACTIVE / CLOSED ALARM tabs are on screen."""
     section = page.locator(
         "xpath=//*[self::h1 or self::h2 or self::h3 or self::h4 or self::h5 or self::div or self::span]"
         "[normalize-space()='Alarm' or normalize-space()='ALARM']"
     ).first
     try:
-        section.wait_for(state="attached")
+        section.wait_for(state="attached", timeout=5000)
         section.evaluate("el => el.scrollIntoView({block: 'start'})")
     except PWError:
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    page.wait_for_timeout(1000)
+        pass
+    for _ in range(25):  # keep scrolling until the tab appears
+        if _closed_tab_visible(page):
+            return
+        page.mouse.wheel(0, 700)
+        page.wait_for_timeout(500)
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page.wait_for_timeout(800)
 
 
 def wait_loading_done(page, timeout=10000):
@@ -548,23 +574,23 @@ def wait_loading_done(page, timeout=10000):
         pass
 
 
-def pw_click_closed_alarm_tab(page):
-    click_first(
-        page,
-        [
-            "xpath=//*[(self::button or self::a or self::li or self::div or self::span or @role='tab')]"
-            "[normalize-space()='CLOSED ALARM' or normalize-space()='Closed Alarm']",
-            f"xpath=//*[contains({UPPER}, 'CLOSED ALARM') and (self::button or self::a or @role='tab' or self::li)]",
-        ],
-        "CLOSED ALARM tab",
-    )
-    page.wait_for_selector("table", state="attached", timeout=60000)
-    try:
-        page.wait_for_selector("table tbody tr", state="attached", timeout=DEFAULT_TIMEOUT * 1000)
-    except PWTimeout:
-        pass
+def pw_click_closed_alarm_tab(page, job_dir: Path):
+    click_first(page, CLOSED_TAB_XPATHS, "CLOSED ALARM tab")
+    # wait until the Closed Alarm table (header has Site ID + Severity) is really on screen
+    end = time.time() + 60
+    headers = []
+    while time.time() < end:
+        data = page.evaluate(READ_TABLE_JS)
+        if data and data["heads"]:
+            headers = data["heads"]
+            if data["rows"]:
+                break
+        page.wait_for_timeout(500)
+    if not headers:
+        raise RuntimeError("The CLOSED ALARM table did not appear after clicking the tab.")
+    job_log(job_dir, f"Closed Alarm table detected, columns: {headers}")
     wait_loading_done(page)
-    page.wait_for_timeout(1000)
+    page.wait_for_timeout(800)
 
 
 # =====================================================================
@@ -578,18 +604,83 @@ JS_SET_VALUE = """(el, v) => {
   el.dispatchEvent(new Event('blur', {bubbles: true}));
 }"""
 
+# The page also has a "Daily Analytics" section with its own Start/End Date boxes and tables.
+# Everything below is anchored to the CLOSED ALARM table (header contains Site ID + Severity),
+# never to "the first visible thing with that label".
+_FIND_TABLE = r"""
+const findTable = () => {
+  const tables = Array.from(document.querySelectorAll('table')).filter(t => t.offsetParent !== null);
+  const head = t => ((t.tHead ? t.tHead.innerText : '') || '').toLowerCase();
+  return tables.find(t => /site\s*id/.test(head(t)) && /severity/.test(head(t)))
+      || tables.find(t => /site\s*id/.test(head(t)))
+      || null;
+};
+"""
+
+MARK_CONTROL_JS = "(kind) => {" + _FIND_TABLE + r"""
+  document.querySelectorAll('[data-pw-target]').forEach(e => e.removeAttribute('data-pw-target'));
+  const table = findTable();
+  if (!table) return 'no-closed-alarm-table';
+  const vis = el => el.offsetParent !== null || el.getClientRects().length > 0;
+  const own = el => Array.from(el.childNodes).filter(n => n.nodeType === 3)
+                         .map(n => n.textContent).join(' ').replace(/[*:]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const before = el => !table.contains(el) && (el.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING);
+  const after = el => !table.contains(el) && (table.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
+  const all = Array.from(document.querySelectorAll('body *'));
+  const tableTop = table.getBoundingClientRect().top;
+  let target = null;
+  if (kind === 'start' || kind === 'end') {
+    const text = kind === 'start' ? 'start date' : 'end date';
+    // the label that sits closest ABOVE the Closed Alarm table
+    const labels = all.filter(el => vis(el) && before(el) && own(el) === text);
+    const label = labels[labels.length - 1];
+    if (!label) return 'no-label';
+    const inputs = Array.from(document.querySelectorAll('input'))
+      .filter(i => vis(i) && (label.contains(i) || (label.compareDocumentPosition(i) & Node.DOCUMENT_POSITION_FOLLOWING)));
+    target = inputs[0];
+  } else if (kind === 'apply') {
+    const btns = Array.from(document.querySelectorAll('button, [role="button"]'))
+      .filter(el => vis(el) && before(el) && (el.innerText || '').replace(/\s+/g, ' ').trim().toUpperCase() === 'APPLY');
+    target = btns[btns.length - 1];
+  } else if (kind === 'items') {
+    const labels = all.filter(el => vis(el) && after(el) && own(el) === 'items');
+    const label = labels[0];
+    if (!label) return 'no-label';
+    const cands = Array.from(document.querySelectorAll('select, [role="combobox"], mat-select, [class*="select"]'))
+      .filter(el => vis(el) && (label.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING));
+    target = cands[0];
+  }
+  if (!target) return 'no-target';
+  target.setAttribute('data-pw-target', kind);
+  const d = Math.round(Math.abs(target.getBoundingClientRect().top - tableTop));
+  return 'ok:' + d;
+}"""
+
+
+def mark_control(page, kind: str, timeout=DEFAULT_TIMEOUT):
+    """Locate a filter control that belongs to the CLOSED ALARM table (not Daily Analytics)."""
+    end = time.time() + timeout
+    res = ""
+    while time.time() < end:
+        res = page.evaluate(MARK_CONTROL_JS, kind)
+        if str(res).startswith("ok"):
+            return page.locator(f"[data-pw-target='{kind}']").first
+        page.wait_for_timeout(400)
+    raise RuntimeError(f"Could not find the '{kind}' control next to the Closed Alarm table (result: {res}).")
+
 
 def pw_set_date(page, job_dir: Path, label: str, value: date):
-    """Type a date into the 'Start Date' / 'End Date' box and verify what the page actually holds."""
+    """Type a date into the Closed Alarm 'Start Date' / 'End Date' box and verify what the page holds."""
     text = value.strftime(DATE_INPUT_FORMAT)
     want = re.sub(r"\D", "", text)
-    lab = first_visible(page, f"xpath=//*[normalize-space(text())='{label}']")
-    inp = lab.locator("xpath=(.//input | following::input)[1]")
+    kind = "start" if label.lower().startswith("start") else "end"
+    inp = mark_control(page, kind)
     inp.wait_for(state="visible", timeout=DEFAULT_TIMEOUT * 1000)
     inp.scroll_into_view_if_needed()
     last = ""
     for mode in ("typed", "digits", "js"):
         try:
+            inp = mark_control(page, kind, 10)
             if mode == "js":
                 inp.evaluate(JS_SET_VALUE, text)
             else:
@@ -599,40 +690,33 @@ def pw_set_date(page, job_dir: Path, label: str, value: date):
                 inp.press_sequentially(text if mode == "typed" else want, delay=50)
             inp.press("Tab")
             page.wait_for_timeout(400)
-            last = inp.input_value()
-        except PWError as exc:
+            last = mark_control(page, kind, 10).input_value()
+        except (PWError, RuntimeError) as exc:
             job_log(job_dir, f"[{label}] mode={mode} error: {str(exc)[:120]}", "WARNING")
             continue
         if re.sub(r"\D", "", last) == want:
-            job_log(job_dir, f"[{label}] set to '{last}' (mode={mode})")
+            job_log(job_dir, f"[{label}] (Closed Alarm filter) set to '{last}' (mode={mode})")
             return
         job_log(job_dir, f"[{label}] mode={mode} left '{last}' instead of '{text}'", "WARNING")
     raise RuntimeError(f"Could not set {label} to {text} (the box shows '{last}').")
 
 
 def pw_click_apply(page):
-    click_first(
-        page,
-        [f"xpath=//button[{UPPER}='APPLY']", f"xpath=//*[@role='button' and {UPPER}='APPLY']"],
-        "Apply button",
-    )
+    safe_click(mark_control(page, "apply"))
 
 
-READ_TABLE_JS = r"""
-() => {
+READ_TABLE_JS = "() => {" + _FIND_TABLE + r"""
   const clean = s => (s || '').replace(/\s+/g, ' ').trim();
-  const table = Array.from(document.querySelectorAll('table')).find(t => t.offsetParent !== null);
+  const table = findTable();
   if (!table) return null;
   const heads = Array.from(table.querySelectorAll('thead th')).map(th => clean(th.innerText));
   const rows = Array.from(table.querySelectorAll('tbody tr')).map(tr =>
       Array.from(tr.querySelectorAll('td')).map(td => clean(td.innerText)));
   return {heads, rows};
-}
-"""
+}"""
 
-TOTAL_PAGES_JS = r"""
-() => {
-  const table = Array.from(document.querySelectorAll('table')).find(t => t.offsetParent !== null);
+TOTAL_PAGES_JS = "() => {" + _FIND_TABLE + r"""
+  const table = findTable();
   if (!table) return 0;
   let max = 0;
   document.querySelectorAll('button, a, li, [role="button"]').forEach(el => {
@@ -641,12 +725,10 @@ TOTAL_PAGES_JS = r"""
     if (/^\d{1,5}$/.test(t)) max = Math.max(max, parseInt(t, 10));
   });
   return max;
-}
-"""
+}"""
 
-FIND_NEXT_JS = r"""
-() => {
-  const table = Array.from(document.querySelectorAll('table')).find(t => t.offsetParent !== null);
+FIND_NEXT_JS = "() => {" + _FIND_TABLE + r"""
+  const table = findTable();
   if (!table) return null;
   const after = el => !table.contains(el) && (table.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
   const vis = el => el.offsetParent !== null || el.getClientRects().length > 0;
@@ -661,8 +743,7 @@ FIND_NEXT_JS = r"""
   if (byText.length) return byText[byText.length - 1];
   const noDigit = cands.filter(el => !/\d/.test(txt(el)));
   return noDigit.length ? noDigit[noDigit.length - 1] : null;
-}
-"""
+}"""
 
 IS_DISABLED_JS = r"""
 el => {
@@ -723,12 +804,9 @@ def pw_set_page_size(page, job_dir: Path):
     if n0 and n0 < 10:
         return n0  # everything already fits on one page
     old = table_sig(rows0)
-    label = first_visible(page, "xpath=//*[normalize-space(text())='Items']", 20)
     for size in PAGE_SIZE_CHOICES:
         try:
-            trigger = label.locator(
-                "xpath=(following::*[self::select or @role='combobox' or self::mat-select "
-                "or contains(@class,'select')])[1]")
+            trigger = mark_control(page, "items", 20)
             trigger.wait_for(state="visible", timeout=8000)
             trigger.scroll_into_view_if_needed()
             if trigger.evaluate("el => el.tagName") == "SELECT":
@@ -968,7 +1046,8 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
                 pw_scroll_to_alarm_section(page)
 
                 rep.running("Opening CLOSED ALARM tab...", 0.22)
-                pw_click_closed_alarm_tab(page)
+                pw_click_closed_alarm_tab(page, job_dir)
+                take_shot(page, job_dir, "shot_0_closed_alarm_tab")
 
                 monitor.phase = "filters"
                 rep.running(f"Setting Start Date {start_d:%d-%m-%Y} and End Date {end_d:%d-%m-%Y}...", 0.26)
