@@ -1,8 +1,10 @@
 """
 PMT Alarm – Closed Alarm downloader (3-step workflow, Playwright edition)
 
-STEP 1  Retrieve Excel  -> login in Chromium, capture the export API call, download the data via requests
-STEP 2  Filter Excel    -> stream the API JSON, keep the chosen Year-Month, write XLSX
+STEP 1  Retrieve Excel  -> login in Chromium, set Start/End Date, set 100 items per page,
+                           then walk through every page of the CLOSED ALARM table and collect the rows
+                           (no Download button, no export API call)
+STEP 2  Filter Excel    -> stream the collected rows, keep the chosen Year-Month, write XLSX
 STEP 3  Download Result -> hand the processed XLSX to the browser (no processing)
 
 All state lives on disk in a per-session job folder (not only in st.session_state),
@@ -21,14 +23,12 @@ import threading
 import time
 import traceback
 import uuid
-from urllib.parse import urlparse
 from datetime import date, datetime, timedelta, timezone
 from itertools import chain, islice
 from pathlib import Path
 
 import streamlit as st
 import ijson
-import requests
 from openpyxl import Workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
@@ -45,25 +45,25 @@ except ImportError:  # diagnostics degrade gracefully
 # ===================== CONFIGURATION =====================
 LOGIN_URL = "https://pmt-alarm.komdigi.go.id/auth/login"
 ALARM_URL = "https://pmt-alarm.komdigi.go.id/dashboard/alarm"
-DOWNLOAD_TIMEOUT = 900        # seconds to wait for the big export (15 min)
 DEFAULT_TIMEOUT = 40          # seconds for normal waits
 JOBS_ROOT = Path(tempfile.gettempdir()) / "pmt_alarm_jobs"
 STALE_AFTER = 300             # a "running" step with no heartbeat for 5 min = interrupted
 JOB_MAX_AGE_HOURS = 12
 POLL_SECONDS = 3
 MEM_GUARD_FRACTION = 0.85     # kill Chromium when the container reaches 85 % of its memory limit
-MEM_LIMIT_MB_OVERRIDE = float(os.environ.get("MEM_LIMIT_MB", 0)) or None  # force a limit if auto-detect fails
+MEM_LIMIT_MB_OVERRIDE = float(os.environ.get("MEM_LIMIT_MB", 0)) or None
 MONITOR_INTERVAL = 2          # seconds between diagnostic samples
-BLOCK_IMAGES = True           # set False to test whether request interception matters
+BLOCK_IMAGES = True
 
-# ---- PMT API (discovered from the captured network log) ----
+SITE_UTC_OFFSET_HOURS = 7     # the site works in WIB (UTC+7)
+DATE_INPUT_FORMAT = "%d-%m-%Y"        # how the Start/End Date boxes display dates (02-10-2026)
+PAGE_SIZE_CHOICES = ("100", "50", "20")  # tried in this order in the "Items" dropdown
+MAX_PAGES = 3000              # safety cap for the pagination loop
+
+# ---- optional: the site's own listing API (only READ from the browser traffic, never replayed) ----
 API_HOST = "pmt-api.komdigi.go.id"
-# the request fired by Export > All Page:  POST https://pmt-api.komdigi.go.id/api/v2/en/alarm
-API_EXPORT_URL_RE = re.compile(r"^https://pmt-api\.komdigi\.go\.id/api/v\d+/[^/]+/alarm/?(\?.*)?$")
-API_DATE_FIELD = None         # e.g. "created_at". None = auto-detect (see Diagnostics after Step 1)
-API_RECORDS_PATH = None       # e.g. "data.item". None = auto-detect
-COLUMN_LABELS = {}            # e.g. {"created_at": "Data Created"} to rename Excel headers
-SITE_UTC_OFFSET_HOURS = 7     # month boundaries are evaluated in WIB (UTC+7)
+API_DATE_FIELD = None         # force the date column used by Step 2, e.g. "Alarm Start Time" or "api.created_at"
+COLUMN_LABELS = {}            # e.g. {"api.created_at": "Created At"} to rename Excel headers
 MONTHS = [
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
@@ -71,9 +71,11 @@ MONTHS = [
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 # =========================================================
 
+WIB = timezone(timedelta(hours=SITE_UTC_OFFSET_HOURS))
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("pmt_alarm")
-faulthandler.enable()  # prints a Python traceback to the app log on fatal signals (SIGSEGV, SIGABRT...)
+faulthandler.enable()
 
 _INSTALL_LOCK = threading.Lock()
 
@@ -111,7 +113,7 @@ class StepReporter:
         )
 
     def running(self, message, progress=None, quiet=False):
-        if not quiet:  # quiet = heartbeat only, don't spam the activity log
+        if not quiet:
             job_log(self.job_dir, f"[step {self.step}] {message}")
         self._write("running", message, progress)
 
@@ -159,6 +161,13 @@ def source_ready(job_dir: Path) -> bool:
     return p.exists() and p.stat().st_size > 0
 
 
+def read_source_meta(job_dir: Path) -> dict:
+    try:
+        return json.loads((job_dir / "source_meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
 # =====================================================================
 #  Diagnostics: container memory, process tree, disk, browser events
 # =====================================================================
@@ -175,7 +184,6 @@ def _mb(v):
 
 
 def cgroup_memory() -> dict:
-    """Container memory from cgroup v2 (or v1). This is the number the platform enforces."""
     used = _read_int("/sys/fs/cgroup/memory.current")
     limit = _read_int("/sys/fs/cgroup/memory.max")
     peak = _read_int("/sys/fs/cgroup/memory.peak")
@@ -183,7 +191,7 @@ def cgroup_memory() -> dict:
         used = _read_int("/sys/fs/cgroup/memory/memory.usage_in_bytes")
         limit = _read_int("/sys/fs/cgroup/memory/memory.limit_in_bytes")
         peak = _read_int("/sys/fs/cgroup/memory/memory.max_usage_in_bytes")
-    if limit is not None and limit > (1 << 40):  # v1 "unlimited"
+    if limit is not None and limit > (1 << 40):
         limit = None
     oom = None
     try:
@@ -197,7 +205,6 @@ def cgroup_memory() -> dict:
 
 
 def process_tree():
-    """[(pid, role, status, rss_mb)] for this process and every child (node driver, Chromium...)."""
     out = []
     if psutil is None:
         return out
@@ -225,7 +232,6 @@ def process_tree():
 
 
 def kill_browser_processes(job_dir: Path):
-    """Last-resort: kill the node driver + Chromium so the container itself is not OOM-killed."""
     if psutil is None:
         return
     try:
@@ -244,7 +250,7 @@ def collect_snapshot(dl_dir: Path) -> dict:
     tree = process_tree()
     chrom = [t for t in tree if t[1].startswith("chromium")]
     used = cg["used_mb"]
-    if used is None and tree:  # no cgroup files: approximate with process RSS
+    if used is None and tree:
         used = sum(t[3] for t in tree)
     files = []
     try:
@@ -278,7 +284,6 @@ def format_snapshot(s: dict) -> str:
     return (
         f"mem {f(s['used'])}/{f(s['limit'])}{pct} peak={f(s['peak'])} oom_kills={s['oom']} | "
         f"chromium procs={s['chrom_n']} rss={f(s['chrom_rss'])} [{top}] | "
-        f"download files={len(s['files'])} biggest={s['dl_mb']:.1f}MB | "
         f"free: tmp={f(s['disk_tmp'])} shm={f(s['disk_shm'])}"
     )
 
@@ -301,11 +306,7 @@ def log_system_info(job_dir: Path):
 
 
 class DiagnosticsMonitor(threading.Thread):
-    """
-    Samples container memory / process tree / download dir every few seconds, writes them to the log
-    (stdout + job.log), refreshes the progress message, and kills Chromium before the container hits
-    its memory limit so the app survives and shows a clear error.
-    """
+    """Samples memory / processes, logs them, and kills Chromium before the container hits its memory limit."""
 
     def __init__(self, job_dir: Path, dl_dir: Path, rep: StepReporter):
         super().__init__(daemon=True)
@@ -341,30 +342,20 @@ class DiagnosticsMonitor(threading.Thread):
 
         if s["chrom_n"]:
             self._seen_chromium = True
-        elif self._seen_chromium and not self._gone_logged:
+        elif self._seen_chromium and not self._gone_logged and self.phase not in ("finished", "closing"):
             self._gone_logged = True
             job_log(self.job_dir, "!!! ALL CHROMIUM PROCESSES ARE GONE (browser exited or was killed). "
                                   f"Last memory state: {format_snapshot(s)}", "ERROR")
 
-        # log every tick for the first 90 s, then every 10 s, and on any +100 MB jump
-        if elapsed < 90 or now - self._last_logged >= 10 or used - self._last_used >= 100:
+        if elapsed < 60 or now - self._last_logged >= 15 or used - self._last_used >= 100:
             self._last_logged, self._last_used = now, used
             job_log(self.job_dir, f"MON +{int(elapsed)}s [{self.phase}] {format_snapshot(s)}")
-
-        if self.phase == "api-download" and not self.tripped:
-            mins, secs = divmod(int(elapsed), 60)
-            lim = f"/{s['limit']:.0f}" if s["limit"] else ""
-            self.rep.running(
-                f"Downloading data from the API (server may take several minutes to respond)... {mins}m {secs:02d}s elapsed, "
-                f"{s['dl_mb']:.1f} MB received · memory {used:.0f}{lim} MB",
-                0.50, quiet=True,
-            )
 
         limit = s["limit"]
         if limit and used > limit * MEM_GUARD_FRACTION and not self.tripped:
             self.tripped = (
                 f"Memory guard stopped Chromium: the container reached {used:.0f} MB of its {limit:.0f} MB limit "
-                f"({used / limit:.0%}) during the export. Chromium used {s['chrom_rss']:.0f} MB."
+                f"({used / limit:.0%}). Chromium used {s['chrom_rss']:.0f} MB."
             )
             job_log(self.job_dir, f"!!! {self.tripped}", "ERROR")
             for pid, role, status, rss in sorted(s["tree"], key=lambda t: -t[3])[:8]:
@@ -373,7 +364,6 @@ class DiagnosticsMonitor(threading.Thread):
 
 
 def attach_diagnostics(job_dir: Path, browser, page):
-    """Log Chromium crashes, console errors, failed requests, and the network calls around the export."""
     counters = {"console": 0, "net": 0}
 
     def guarded(fn):
@@ -386,36 +376,18 @@ def attach_diagnostics(job_dir: Path, browser, page):
 
     @guarded
     def on_console(msg):
-        if msg.type in ("error", "warning") and counters["console"] < 200:
+        if msg.type in ("error", "warning") and counters["console"] < 100:
             counters["console"] += 1
             job_log(job_dir, f"[console.{msg.type}] {msg.text[:300]}", "WARNING")
 
-    @guarded
-    def on_response(resp):
-        req = resp.request
-        if req.resource_type not in ("xhr", "fetch", "document") or API_HOST in resp.url:
-            return
-        counters["net"] += 1
-        n = counters["net"]
-        if n <= 40 or n % 25 == 0:
-            h = resp.headers
-            job_log(job_dir, f"[net #{n}] {resp.status} {req.method} {req.resource_type} "
-                             f"{resp.url.split('?')[0][:140]} len={h.get('content-length', '?')} "
-                             f"type={h.get('content-type', '?')[:40]}")
-
     browser.on("disconnected", guarded(lambda *_: job_log(
-        job_dir, "!!! BROWSER DISCONNECTED: the Chromium process exited or crashed", "ERROR")))
+        job_dir, "BROWSER DISCONNECTED (closed or crashed)", "WARNING")))
     page.on("crash", guarded(lambda *_: job_log(
         job_dir, "!!! PAGE CRASHED: the renderer process died (usually out of memory)", "ERROR")))
-    page.on("close", guarded(lambda *_: job_log(job_dir, "[page] closed", "WARNING")))
     page.on("console", on_console)
     page.on("pageerror", guarded(lambda err: job_log(job_dir, f"[pageerror] {str(err)[:300]}", "WARNING")))
     page.on("requestfailed", guarded(lambda r: job_log(
         job_dir, f"[requestfailed] {r.method} {r.url[:150]} -> {r.failure}", "WARNING")))
-    page.on("response", on_response)
-    page.on("download", guarded(lambda d: job_log(
-        job_dir, f"[download event] file={d.suggested_filename} url={d.url[:150]}")))
-    page.on("popup", guarded(lambda p: job_log(job_dir, f"[popup] {p.url[:150]}", "WARNING")))
 
 
 def take_shot(page, job_dir: Path, name: str):
@@ -430,21 +402,15 @@ def take_shot(page, job_dir: Path, name: str):
 #  Playwright helpers
 # =====================================================================
 def launch_browser(pw, job_dir: Path, dl_dir: Path):
-    """
-    Launch headless Chromium.
-    1) system Chromium (Streamlit Cloud via packages.txt) if available,
-    2) otherwise Playwright's own Chromium, installing it on first use.
-    """
     args = [
         "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--mute-audio",
-        # fewer processes / less memory
         "--renderer-process-limit=1", "--no-zygote",
         "--disable-features=IsolateOrigins,site-per-process", "--disable-site-isolation-trials",
         "--disable-extensions", "--disable-background-networking", "--disable-sync",
         "--disable-component-update", "--disable-breakpad", "--metrics-recording-only", "--no-first-run",
     ]
     limit = cgroup_memory()["limit_mb"]
-    if limit:  # make a runaway page die inside Chromium (page crash) instead of OOM-killing the container
+    if limit:
         args.append(f"--js-flags=--max-old-space-size={int(max(256, limit * 0.45))}")
 
     kwargs = dict(headless=True, downloads_path=str(dl_dir), args=args)
@@ -476,21 +442,43 @@ def launch_browser(pw, job_dir: Path, dl_dir: Path):
     return pw.chromium.launch(**kwargs)
 
 
+def first_visible(page, selector, timeout=DEFAULT_TIMEOUT):
+    """Return the first VISIBLE match of a selector (the hidden 'Active Alarm' tab may contain look-alikes)."""
+    loc = page.locator(selector)
+    end = time.time() + timeout
+    while True:
+        try:
+            n = loc.count()
+            for i in range(n):
+                cand = loc.nth(i)
+                if cand.is_visible():
+                    return cand
+        except PWError:
+            pass
+        if time.time() > end:
+            raise RuntimeError(f"No visible element found for: {selector}")
+        page.wait_for_timeout(300)
+
+
+def safe_click(loc, timeout=10000):
+    try:
+        loc.scroll_into_view_if_needed(timeout=timeout)
+    except PWError:
+        pass
+    try:
+        loc.click(timeout=timeout)
+    except PWError:
+        loc.evaluate("el => el.click()")
+
+
 def click_first(page, selectors, description, total_timeout=DEFAULT_TIMEOUT):
-    """Try several selectors in turn; click the first visible one (JS-click fallback)."""
-    per = max(5000, int(total_timeout * 1000 / max(1, len(selectors))))
+    per = max(5, int(total_timeout / max(1, len(selectors))))
     last_exc = None
     for sel in selectors:
-        loc = page.locator(sel).first
         try:
-            loc.wait_for(state="visible", timeout=per)
-            loc.scroll_into_view_if_needed(timeout=per)
-            try:
-                loc.click(timeout=per)
-            except PWError:
-                loc.evaluate("el => el.click()")
+            safe_click(first_visible(page, sel, per))
             return
-        except PWError as exc:
+        except (PWError, RuntimeError) as exc:
             last_exc = exc
             log.warning("Selector failed for %s: %s", description, sel)
     raise RuntimeError(f"Could not click {description}: {str(last_exc)[:200]}")
@@ -550,6 +538,16 @@ def pw_scroll_to_alarm_section(page):
     page.wait_for_timeout(1000)
 
 
+def wait_loading_done(page, timeout=10000):
+    try:
+        page.wait_for_selector(
+            ".spinner, .loading, .loader, .spinner-border, [class*='loading'], [class*='spinner']",
+            state="hidden", timeout=timeout,
+        )
+    except PWError:
+        pass
+
+
 def pw_click_closed_alarm_tab(page):
     click_first(
         page,
@@ -565,75 +563,205 @@ def pw_click_closed_alarm_tab(page):
         page.wait_for_selector("table tbody tr", state="attached", timeout=DEFAULT_TIMEOUT * 1000)
     except PWTimeout:
         pass
-    try:
-        page.wait_for_selector(
-            ".spinner, .loading, .loader, .spinner-border, [class*='loading'], [class*='spinner']",
-            state="hidden", timeout=10000,
-        )
-    except PWError:
-        pass
+    wait_loading_done(page)
     page.wait_for_timeout(1000)
 
 
-def pw_open_download_menu(page):
+# =====================================================================
+#  Filter controls: Start Date / End Date / Apply / Items per page
+# =====================================================================
+JS_SET_VALUE = """(el, v) => {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+  setter.call(el, v);
+  el.dispatchEvent(new Event('input', {bubbles: true}));
+  el.dispatchEvent(new Event('change', {bubbles: true}));
+  el.dispatchEvent(new Event('blur', {bubbles: true}));
+}"""
+
+
+def pw_set_date(page, job_dir: Path, label: str, value: date):
+    """Type a date into the 'Start Date' / 'End Date' box and verify what the page actually holds."""
+    text = value.strftime(DATE_INPUT_FORMAT)
+    want = re.sub(r"\D", "", text)
+    lab = first_visible(page, f"xpath=//*[normalize-space(text())='{label}']")
+    inp = lab.locator("xpath=(.//input | following::input)[1]")
+    inp.wait_for(state="visible", timeout=DEFAULT_TIMEOUT * 1000)
+    inp.scroll_into_view_if_needed()
+    last = ""
+    for mode in ("typed", "digits", "js"):
+        try:
+            if mode == "js":
+                inp.evaluate(JS_SET_VALUE, text)
+            else:
+                inp.click()
+                inp.press("Control+A")
+                inp.press("Backspace")
+                inp.press_sequentially(text if mode == "typed" else want, delay=50)
+            inp.press("Tab")
+            page.wait_for_timeout(400)
+            last = inp.input_value()
+        except PWError as exc:
+            job_log(job_dir, f"[{label}] mode={mode} error: {str(exc)[:120]}", "WARNING")
+            continue
+        if re.sub(r"\D", "", last) == want:
+            job_log(job_dir, f"[{label}] set to '{last}' (mode={mode})")
+            return
+        job_log(job_dir, f"[{label}] mode={mode} left '{last}' instead of '{text}'", "WARNING")
+    raise RuntimeError(f"Could not set {label} to {text} (the box shows '{last}').")
+
+
+def pw_click_apply(page):
     click_first(
         page,
-        [
-            f"xpath=//button[contains({UPPER}, 'DOWNLOAD ALARM')]",
-            f"xpath=//*[contains({UPPER}, 'DOWNLOAD ALARM') and (self::a or self::button or @role='button')]",
-            "css=button.btn-success",
-        ],
-        "Download Alarm button",
+        [f"xpath=//button[{UPPER}='APPLY']", f"xpath=//*[@role='button' and {UPPER}='APPLY']"],
+        "Apply button",
     )
 
 
-def pw_click_all_page(page):
-    click_first(
-        page,
-        [
-            "xpath=//*[(self::a or self::button or self::li or self::span or self::div "
-            "or @role='menuitem') and (normalize-space()='All Page' or normalize-space()='All page')]",
-            f"xpath=//*[contains({UPPER}, 'ALL PAGE') and (self::a or self::button or self::li or @role='menuitem')]",
-        ],
-        "All Page option",
-    )
+READ_TABLE_JS = r"""
+() => {
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+  const table = Array.from(document.querySelectorAll('table')).find(t => t.offsetParent !== null);
+  if (!table) return null;
+  const heads = Array.from(table.querySelectorAll('thead th')).map(th => clean(th.innerText));
+  const rows = Array.from(table.querySelectorAll('tbody tr')).map(tr =>
+      Array.from(tr.querySelectorAll('td')).map(td => clean(td.innerText)));
+  return {heads, rows};
+}
+"""
+
+TOTAL_PAGES_JS = r"""
+() => {
+  const table = Array.from(document.querySelectorAll('table')).find(t => t.offsetParent !== null);
+  if (!table) return 0;
+  let max = 0;
+  document.querySelectorAll('button, a, li, [role="button"]').forEach(el => {
+    if (table.contains(el) || !(table.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) return;
+    const t = (el.innerText || '').trim();
+    if (/^\d{1,5}$/.test(t)) max = Math.max(max, parseInt(t, 10));
+  });
+  return max;
+}
+"""
+
+FIND_NEXT_JS = r"""
+() => {
+  const table = Array.from(document.querySelectorAll('table')).find(t => t.offsetParent !== null);
+  if (!table) return null;
+  const after = el => !table.contains(el) && (table.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
+  const vis = el => el.offsetParent !== null || el.getClientRects().length > 0;
+  const cands = Array.from(document.querySelectorAll('button, a, [role="button"]')).filter(el => after(el) && vis(el));
+  if (!cands.length) return null;
+  const txt = el => (el.innerText || '').trim();
+  const cls = el => (el.className && el.className.toString) ? el.className.toString() : '';
+  const meta = el => ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '') + ' ' + cls(el)).toLowerCase();
+  const byMeta = cands.filter(el => /next|chevron_right|chevron-right|arrow_forward/.test(meta(el)) && !/last|prev|first/.test(meta(el)));
+  if (byMeta.length) return byMeta[byMeta.length - 1];
+  const byText = cands.filter(el => /^(chevron_right|navigate_next|keyboard_arrow_right|arrow_forward_ios|arrow_right|›|>|»)$/i.test(txt(el)));
+  if (byText.length) return byText[byText.length - 1];
+  const noDigit = cands.filter(el => !/\d/.test(txt(el)));
+  return noDigit.length ? noDigit[noDigit.length - 1] : null;
+}
+"""
+
+IS_DISABLED_JS = r"""
+el => {
+  const cls = n => ((n && n.className && n.className.toString) ? n.className.toString() : '').toLowerCase();
+  const p = el.parentElement;
+  return !!(el.disabled || el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'
+            || /disabled/.test(cls(el)) || (p && /disabled/.test(cls(p))));
+}
+"""
+
+_ICON_TAIL_RE = re.compile(r"\s+(info|info_outline|help|help_outline|arrow_upward|arrow_downward|unfold_more)$", re.I)
 
 
-# =====================================================================
-#  API discovery + capture (replaces the browser export)
-# =====================================================================
-SENSITIVE_RE = re.compile(r"pass|pwd|secret|otp|token", re.I)
+def read_table(page):
+    """Return (headers, rows) of the visible table. rows = list of list[str]."""
+    data = page.evaluate(READ_TABLE_JS)
+    if not data:
+        return [], []
+    rows = [r for r in data["rows"] if len(r) >= 3 and any(r)]   # skip 'no data' placeholder rows
+    width = max([len(data["heads"])] + [len(r) for r in rows])
+    seen, headers = {}, []
+    for i in range(width):
+        h = _ICON_TAIL_RE.sub("", data["heads"][i]).strip() if i < len(data["heads"]) else ""
+        h = h or f"col_{i + 1}"
+        n = seen.get(h, 0)
+        seen[h] = n + 1
+        headers.append(h if n == 0 else f"{h}_{n + 1}")
+    return headers, rows
 
 
-def redact_headers(headers: dict) -> dict:
-    out = {}
-    for k, v in headers.items():
-        lk, v = k.lower(), str(v)
-        if lk in ("authorization", "cookie", "proxy-authorization") or "token" in lk or "api-key" in lk:
-            out[k] = f"{v[:12]}…(len {len(v)})"
-        else:
-            out[k] = v[:150]
-    return out
-
-
-def redact_payload(body) -> str:
-    if not body:
+def table_sig(rows):
+    if not rows:
         return ""
-    text = body.decode("utf-8", "replace") if isinstance(body, (bytes, bytearray)) else str(body)
-
-    def red(o):
-        if isinstance(o, dict):
-            return {k: ("***" if SENSITIVE_RE.search(str(k)) else red(v)) for k, v in o.items()}
-        if isinstance(o, list):
-            return [red(x) for x in o[:20]]
-        return o
-
-    try:
-        return json.dumps(red(json.loads(text)), ensure_ascii=False)[:1500]
-    except ValueError:
-        return re.sub(r"(?i)([^&=]*(?:pass|pwd|secret|token|otp)[^&=]*=)[^&]*", r"\1***", text)[:1500]
+    return f"{len(rows)}|{'¦'.join(rows[0])}|{'¦'.join(rows[-1])}"
 
 
+def wait_table_change(page, old_sig, timeout=30):
+    """Wait until the table content differs from old_sig and has stopped changing."""
+    end = time.time() + timeout
+    while time.time() < end:
+        _, rows = read_table(page)
+        if rows:
+            s = table_sig(rows)
+            if s != old_sig:
+                page.wait_for_timeout(500)
+                _, rows2 = read_table(page)
+                if rows2 and table_sig(rows2) == s:
+                    return True
+                continue
+        page.wait_for_timeout(400)
+    return False
+
+
+def pw_set_page_size(page, job_dir: Path):
+    """Pick 100 (or 50 / 20) in the 'Items' dropdown. Returns the number of rows now shown."""
+    _, rows0 = read_table(page)
+    n0 = len(rows0)
+    if n0 and n0 < 10:
+        return n0  # everything already fits on one page
+    old = table_sig(rows0)
+    label = first_visible(page, "xpath=//*[normalize-space(text())='Items']", 20)
+    for size in PAGE_SIZE_CHOICES:
+        try:
+            trigger = label.locator(
+                "xpath=(following::*[self::select or @role='combobox' or self::mat-select "
+                "or contains(@class,'select')])[1]")
+            trigger.wait_for(state="visible", timeout=8000)
+            trigger.scroll_into_view_if_needed()
+            if trigger.evaluate("el => el.tagName") == "SELECT":
+                try:
+                    trigger.select_option(label=size)
+                except PWError:
+                    trigger.select_option(value=size)
+            else:
+                safe_click(trigger)
+                opt = first_visible(
+                    page,
+                    f"xpath=//*[(@role='option' or self::mat-option or self::li or self::option) "
+                    f"and normalize-space()='{size}']", 8)
+                safe_click(opt)
+            wait_table_change(page, old, 20)
+            _, rows = read_table(page)
+            if len(rows) > n0:
+                job_log(job_dir, f"Page size set to {size}: {len(rows)} rows on the page now.")
+                return len(rows)
+            job_log(job_dir, f"Page size {size} did not change the table ({len(rows)} rows).", "WARNING")
+        except (PWError, RuntimeError) as exc:
+            job_log(job_dir, f"Page size {size} failed: {str(exc)[:150]}", "WARNING")
+        try:
+            page.keyboard.press("Escape")
+        except PWError:
+            pass
+    job_log(job_dir, "Could not change the page size; continuing with the default (slower).", "WARNING")
+    return n0
+
+
+# =====================================================================
+#  Optional: read the site's own listing API traffic (for real dates)
+# =====================================================================
 def find_records_path(obj, max_depth=6):
     """Return (path, records): the biggest list of dicts inside a JSON document."""
     best = ([], [])
@@ -653,50 +781,19 @@ def find_records_path(obj, max_depth=6):
     return best
 
 
-def prefix_from_path(path) -> str:
-    return ".".join(list(path) + ["item"])
-
-
-def describe_json(obj) -> dict:
-    info = {"type": type(obj).__name__}
-    if isinstance(obj, dict):
-        info["top_keys"] = list(obj.keys())[:30]
-        info["nested_keys"] = {k: list(v.keys())[:15] for k, v in list(obj.items())[:10] if isinstance(v, dict)}
-    path, recs = find_records_path(obj)
-    if recs:
-        first = recs[0]
-        info["records_path"] = ".".join(path) or "(root list)"
-        info["records_in_response"] = len(recs)
-        info["fields"] = list(first.keys())[:80]
-        info["sample_record"] = {k: str(v)[:40] for k, v in list(first.items())[:80]}
-    return info
-
-
-def url_key(url: str) -> str:
-    return url.split("?")[0]
-
-
-class ApiCapture:
+class ListingCapture:
     """
-    Records the site's API traffic (redacted) and, once armed, CAPTURES the export request and
-    ABORTS it inside the browser so Chromium never receives (or renders) the huge response.
-    The real headers/body are kept in memory only, never written to disk or logs.
+    Passively remembers the JSON the site's own table requests receive (small: one page each).
+    Nothing is replayed and nothing is stored on disk. It is used to add real date fields to the
+    scraped rows, because the table shows 'Invalid date' in the Alarm Start Time column.
     """
 
     def __init__(self, job_dir: Path):
         self.job_dir = job_dir
-        self.export_armed = False
-        self.export_requests = []   # real data, in memory only
-        self.calls = []             # redacted, saved to api_capture.json
-        self.structures = {}        # url_key -> {"prefix":..., "describe":...}
-        self.login = None
-        self.last_listing = None
-        self._n = 0
+        self.items = []
+        self.n = 0
 
-    # ---- wiring
     def attach(self, page):
-        page.route(API_EXPORT_URL_RE, self._on_route)
-        page.on("request", self._guard(self._on_request))
         page.on("response", self._guard(self._on_response))
 
     @staticmethod
@@ -704,190 +801,150 @@ class ApiCapture:
         def wrapper(*args):
             try:
                 fn(*args)
-            except Exception as exc:
-                log.debug("api-capture handler error: %s", exc)
+            except Exception:
+                pass
         return wrapper
-
-    def _record(self, kind, req, body):
-        rec = {
-            "kind": kind, "method": req.method, "url": req.url, "resource_type": req.resource_type,
-            "headers": redact_headers(req.headers), "payload": redact_payload(body),
-            "payload_bytes": len(body) if body else 0,
-        }
-        if len(self.calls) < 150:
-            self.calls.append(rec)
-        return rec
-
-    # ---- handlers
-    def _on_route(self, route, *_):
-        req = route.request
-        if self.export_armed:
-            body = req.post_data_buffer
-            self.export_requests.append(
-                {"method": req.method, "url": req.url, "headers": dict(req.headers), "body": body}
-            )
-            rec = self._record("EXPORT", req, body)
-            job_log(self.job_dir, f"[EXPORT-REQUEST CAPTURED] {req.method} {url_key(req.url)} "
-                                  f"payload_bytes={rec['payload_bytes']} payload={rec['payload'][:600]} "
-                                  f"headers={list(rec['headers'].keys())}")
-            route.abort()  # Chromium must NOT process the multi-hundred-MB response
-        else:
-            route.fallback()
-
-    def _on_request(self, req):
-        if API_HOST not in req.url or req.resource_type not in ("xhr", "fetch"):
-            return
-        if self.export_armed and API_EXPORT_URL_RE.match(req.url):
-            return  # logged by _on_route
-        body = req.post_data_buffer if req.method.upper() != "GET" else None
-        self._n += 1
-        rec = self._record("api", req, body)
-        if API_EXPORT_URL_RE.match(req.url):
-            self.last_listing = rec
-        if re.search(r"login|signin|sign-in|auth|token", req.url, re.I) and req.method.upper() == "POST":
-            self.login = rec
-        if self._n <= 60:
-            job_log(self.job_dir, f"[api-req #{self._n}] {req.method} {url_key(req.url)} "
-                                  f"auth={'yes' if 'authorization' in req.headers else 'no'} "
-                                  f"payload={rec['payload'][:300]}")
 
     def _on_response(self, resp):
         req = resp.request
-        if API_HOST not in resp.url or req.resource_type not in ("xhr", "fetch"):
+        if API_HOST not in resp.url or req.resource_type not in ("xhr", "fetch") or resp.status != 200:
             return
-        ctype = resp.headers.get("content-type", "")
-        length = int(resp.headers.get("content-length", "0") or 0)
-        job_log(self.job_dir, f"[api-resp] {resp.status} {req.method} {url_key(resp.url)} "
-                              f"type={ctype[:30]} len={length}")
-        if "json" in ctype and length < 2_000_000 and len(self.structures) < 15:
-            data = json.loads(resp.body())
-            info = describe_json(data)
-            path, recs = find_records_path(data)
-            entry = {"describe": info, "prefix": prefix_from_path(path) if recs else None}
-            self.structures.setdefault(url_key(resp.url), entry)
-            if self.login is not None and req.url == self.login["url"]:
-                entry["describe"].pop("sample_record", None)  # never keep login response values
-            job_log(self.job_dir, f"[api-struct] {url_key(resp.url)} top_keys={info.get('top_keys')} "
-                                  f"records_path={info.get('records_path')} "
-                                  f"records={info.get('records_in_response')} fields={info.get('fields')}")
-
-    # ---- output
-    def save(self):
-        out = {
-            "login_request": self.login,
-            "listing_request_before_export": self.last_listing,
-            "export_request": next((c for c in self.calls if c["kind"] == "EXPORT"), None),
-            "structures": self.structures,
-            "all_calls": self.calls,
-        }
-        (self.job_dir / "api_capture.json").write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+        if "json" not in resp.headers.get("content-type", ""):
+            return
+        if int(resp.headers.get("content-length", "0") or 0) > 8_000_000:
+            return
+        data = json.loads(resp.body())
+        path, recs = find_records_path(data)
+        if not recs:
+            return
+        self.n += 1
+        self.items.append({"t": time.time(), "url": resp.url.split("?")[0], "records": recs})
+        del self.items[:-8]
+        if self.n <= 12:
+            flat_first = flatten(recs[0])
+            job_log(self.job_dir, f"[listing #{self.n}] {resp.url.split('?')[0][-70:]} path={'.'.join(path) or '(root)'} "
+                                  f"records={len(recs)} fields={list(flat_first.keys())[:40]}")
 
 
-# =====================================================================
-#  Direct API download (no browser)
-# =====================================================================
-DROP_HEADERS = {"host", "content-length", "connection", "accept-encoding", "cookie",
-                "transfer-encoding", "keep-alive", "upgrade-insecure-requests"}
+API_EXTRA_KEY_RE = re.compile(r"date|time|_at$|^at$|creat|updat|start|clos|end$|resolv", re.I)
 
 
-def build_replay_headers(export: dict) -> dict:
-    headers = {k: v for k, v in export["headers"].items()
-               if k.lower() not in DROP_HEADERS and not k.startswith(":") and not k.lower().startswith("sec-")}
-    present = {k.lower() for k in headers}
-    origin = "{0.scheme}://{0.netloc}".format(urlparse(ALARM_URL))
-    if "user-agent" not in present:
-        headers["User-Agent"] = export.get("user_agent") or "Mozilla/5.0 (X11; Linux x86_64) Chrome/124.0 Safari/537.36"
-    if "origin" not in present:
-        headers["Origin"] = origin
-    if "referer" not in present:
-        headers["Referer"] = ALARM_URL
-    headers["Accept-Encoding"] = "gzip, deflate"
-    cookies = export.get("cookies") or []
-    if cookies:
-        headers["Cookie"] = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-    return headers
+def match_api(listing: ListingCapture, since: float, rows):
+    """Find the captured API page that corresponds to the rows currently shown. Returns list of flat dicts or None."""
+    if not rows:
+        return None
 
+    def overlap(cells, flat):
+        vals = {str(v).strip() for v in flat.values() if v is not None}
+        return sum(1 for c in cells if len(c) > 2 and c in vals)
 
-def download_via_api(job_dir: Path, export: dict, dest: Path, monitor) -> int:
-    """Replay the captured export request with `requests` and stream the body to disk."""
-    headers = build_replay_headers(export)
-    job_log(job_dir, f"API replay: {export['method']} {url_key(export['url'])} "
-                     f"headers={redact_headers(headers)} body_bytes={len(export['body'] or b'')}")
-    with requests.Session() as sess:
-        resp = sess.request(
-            export["method"], export["url"], headers=headers, data=export["body"],
-            stream=True, timeout=(30, DOWNLOAD_TIMEOUT),
-        )
-        job_log(job_dir, f"API replay response: HTTP {resp.status_code} "
-                         f"type={resp.headers.get('content-type')} length={resp.headers.get('content-length')} "
-                         f"encoding={resp.headers.get('content-encoding')}")
-        if resp.status_code >= 400:
-            snippet = next(resp.iter_content(1024), b"")[:300].decode("utf-8", "replace")
-            hint = (" The token/cookie captured from the browser was not accepted; "
-                    "see api_capture.json for the headers that were sent."
-                    if resp.status_code in (401, 403) else "")
-            raise RuntimeError(f"API rejected the export request (HTTP {resp.status_code}): {snippet}{hint}")
-
-        written, first = 0, b""
-        with open(dest, "wb") as fh:
-            for chunk in resp.iter_content(chunk_size=1 << 20):
-                if monitor is not None and monitor.tripped:
-                    raise RuntimeError(monitor.tripped)
-                if not chunk:
-                    continue
-                if not first:
-                    first = chunk[:200]
-                fh.write(chunk)
-                written += len(chunk)
-
-    if not first.lstrip(b"\xef\xbb\xbf \r\n\t")[:1] in (b"{", b"["):
-        raise RuntimeError("The API did not return JSON. First bytes: "
-                           f"{first[:120]!r} (content-type {resp.headers.get('content-type')}).")
-    return written
-
-
-def detect_prefix_from_file(path: Path):
-    """Fallback: first array of objects found while streaming the file."""
-    last_array = None
-    with open(path, "rb") as fh:
-        for i, (prefix, event, _value) in enumerate(ijson.parse(fh)):
-            if event == "start_array":
-                last_array = prefix
-            elif event == "start_map" and last_array is not None and prefix == (f"{last_array}.item" if last_array else "item"):
-                return prefix
-            elif i > 3_000_000:
-                break
+    for item in reversed(listing.items):
+        if item["t"] < since - 0.5 or len(item["records"]) != len(rows):
+            continue
+        flats = [flatten(r) for r in item["records"]]
+        if overlap(rows[0], flats[0]) >= 2 and overlap(rows[-1], flats[-1]) >= 2:
+            return flats
     return None
 
 
 # =====================================================================
-#  STEP 1 worker – capture the export request, then download via API
+#  Page-by-page scraping
 # =====================================================================
-def retrieve_worker(job_dir: Path, username: str, password: str):
+def find_next(page):
+    handle = page.evaluate_handle(FIND_NEXT_JS)
+    el = handle.as_element()
+    if el is None:
+        return None, True
+    return el, bool(el.evaluate(IS_DISABLED_JS))
+
+
+def scrape_all_pages(page, job_dir: Path, rep: StepReporter, listing: ListingCapture, monitor, browser, since: float):
+    all_rows, page_no, api_pages = [], 0, 0
+    headers, rows = read_table(page)
+    if not rows:
+        raise RuntimeError("The table is empty for this date range (no closed alarms found).")
+    total_pages = max(1, page.evaluate(TOTAL_PAGES_JS))
+
+    while True:
+        page_no += 1
+        flats = match_api(listing, since, rows)
+        if flats:
+            api_pages += 1
+        for i, cells in enumerate(rows):
+            rec = dict(zip(headers, cells))
+            if flats:
+                for k, v in flats[i].items():
+                    if API_EXTRA_KEY_RE.search(k) and not isinstance(v, (dict, list)):
+                        rec[f"api.{k}"] = v
+            all_rows.append(rec)
+
+        total_pages = max(total_pages, page_no, page.evaluate(TOTAL_PAGES_JS))
+        rep.running(f"Scraping page {page_no} of ~{total_pages}: {len(all_rows):,} rows collected...",
+                    0.40 + 0.55 * min(page_no / total_pages, 1.0))
+
+        if monitor is not None and monitor.tripped:
+            raise RuntimeError(monitor.tripped)
+        if not browser.is_connected() or page.is_closed():
+            raise RuntimeError("Chromium exited while scraping the table.")
+        if page_no >= MAX_PAGES:
+            job_log(job_dir, f"Reached the safety cap of {MAX_PAGES} pages.", "WARNING")
+            break
+
+        nxt, disabled = find_next(page)
+        if nxt is None:
+            job_log(job_dir, "No 'next page' button found: assuming this is the only/last page.", "WARNING")
+            break
+        if disabled:
+            job_log(job_dir, f"'Next' is disabled on page {page_no}: that was the last page.")
+            break
+
+        old = table_sig(rows)
+        since = time.time()
+        changed = False
+        for attempt in (1, 2):
+            safe_click(nxt)
+            if wait_table_change(page, old, 25):
+                changed = True
+                break
+            job_log(job_dir, f"Page {page_no}: table did not change after clicking next (attempt {attempt}).", "WARNING")
+            nxt, disabled = find_next(page)
+            if nxt is None or disabled:
+                break
+        if not changed:
+            job_log(job_dir, "Table stopped changing: assuming the last page was reached.")
+            break
+        headers, rows = read_table(page)
+        if not rows:
+            break
+
+    return all_rows, page_no, api_pages
+
+
+# =====================================================================
+#  STEP 1 worker – set filters, then walk through every page
+# =====================================================================
+def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, end_d: date):
     rep = StepReporter(job_dir, 1)
     dl_dir = job_dir / "dl"
-    part = dl_dir / "alarm_export.json.part"
     shutil.rmtree(dl_dir, ignore_errors=True)
     dl_dir.mkdir(parents=True, exist_ok=True)
-    for pattern in ("shot_*.png", "api_capture.json", "source_meta.json"):
+    for pattern in ("shot_*.png", "source_meta.json", "error.png", "source.part"):
         for old in job_dir.glob(pattern):
             old.unlink(missing_ok=True)
 
     monitor = None
-    export = None
-    capture = ApiCapture(job_dir)
     try:
         log_system_info(job_dir)
+        job_log(job_dir, f"Requested range: {start_d:%d-%m-%Y} -> {end_d:%d-%m-%Y}")
         rep.running("Starting browser...", 0.05)
         monitor = DiagnosticsMonitor(job_dir, dl_dir, rep)
         monitor.start()
 
-        # ---------------- browser: login + capture only ----------------
         with sync_playwright() as pw:
             browser = launch_browser(pw, job_dir, dl_dir)
             page = None
             try:
-                context = browser.new_context(accept_downloads=False, viewport={"width": 1600, "height": 900})
+                context = browser.new_context(accept_downloads=False, viewport={"width": 1600, "height": 1000})
                 if BLOCK_IMAGES:
                     context.route(
                         "**/*",
@@ -898,46 +955,49 @@ def retrieve_worker(job_dir: Path, username: str, password: str):
                 page = context.new_page()
                 page.set_default_timeout(DEFAULT_TIMEOUT * 1000)
                 attach_diagnostics(job_dir, browser, page)
-                capture.attach(page)
+                listing = ListingCapture(job_dir)
+                listing.attach(page)
 
                 monitor.phase = "login"
-                rep.running("Logging in...", 0.15)
+                rep.running("Logging in...", 0.10)
                 pw_login(page, username, password)
 
                 monitor.phase = "alarm-page"
-                rep.running("Opening alarm page...", 0.25)
+                rep.running("Opening alarm page...", 0.18)
                 pw_open_alarm_page(page)
                 pw_scroll_to_alarm_section(page)
 
-                rep.running("Opening CLOSED ALARM tab...", 0.30)
+                rep.running("Opening CLOSED ALARM tab...", 0.22)
                 pw_click_closed_alarm_tab(page)
-                job_log(job_dir, "=== BEFORE export click === " + format_snapshot(collect_snapshot(dl_dir)))
-                take_shot(page, job_dir, "shot_1_before_export")
 
-                monitor.phase = "capture"
-                rep.running("Capturing the export API request (the heavy browser export is blocked)...", 0.35)
-                pw_open_download_menu(page)
-                capture.export_armed = True       # from now on the alarm API call is captured + aborted
-                pw_click_all_page(page)
+                monitor.phase = "filters"
+                rep.running(f"Setting Start Date {start_d:%d-%m-%Y} and End Date {end_d:%d-%m-%Y}...", 0.26)
+                pw_set_date(page, job_dir, "Start Date", start_d)
+                pw_set_date(page, job_dir, "End Date", end_d)
+                take_shot(page, job_dir, "shot_1_filters")
 
-                end = time.time() + 60
-                while not capture.export_requests and time.time() < end:
-                    if not browser.is_connected() or page.is_closed():
-                        raise RuntimeError("Chromium exited while capturing the export request.")
-                    page.wait_for_timeout(500)
-                if not capture.export_requests:
-                    raise RuntimeError("Clicking Export > All Page did not send a request to the alarm API. "
-                                       "Check the [api-req] lines and api_capture.json in Diagnostics.")
-                page.wait_for_timeout(1500)  # collect any additional calls triggered by the click
-                job_log(job_dir, f"Captured {len(capture.export_requests)} export request(s); using the first one.")
-                export = capture.export_requests[0]
-                export["cookies"] = context.cookies([export["url"]])
-                try:
-                    export["user_agent"] = page.evaluate("navigator.userAgent").replace("HeadlessChrome", "Chrome")
-                except Exception:
-                    export["user_agent"] = None
-                take_shot(page, job_dir, "shot_2_after_export")
-                job_log(job_dir, "=== AFTER capture === " + format_snapshot(collect_snapshot(dl_dir)))
+                _, rows_before = read_table(page)
+                since = time.time()
+                rep.running("Applying the filter...", 0.30)
+                pw_click_apply(page)
+                wait_table_change(page, table_sig(rows_before), 25)
+                wait_loading_done(page)
+                page.wait_for_timeout(800)
+
+                rep.running("Setting items per page...", 0.34)
+                pw_set_page_size(page, job_dir)
+                take_shot(page, job_dir, "shot_2_after_page_size")
+
+                monitor.phase = "scrape"
+                rep.running("Reading the table page by page...", 0.40)
+                all_rows, pages, api_pages = scrape_all_pages(page, job_dir, rep, listing, monitor, browser, since)
+                job_log(job_dir, f"Scraped {len(all_rows):,} rows from {pages} pages "
+                                 f"(real API dates attached on {api_pages} of {pages} pages).")
+                if api_pages == 0:
+                    job_log(job_dir, "No API date fields could be attached. If the Alarm Start Time column says "
+                                     "'Invalid date', Step 2 will not be able to filter by month. "
+                                     "See the [listing #n] lines above.", "WARNING")
+                take_shot(page, job_dir, "shot_3_last_page")
             except Exception:
                 job_log(job_dir, "State at failure: " + format_snapshot(collect_snapshot(dl_dir)), "ERROR")
                 if page is not None:
@@ -947,34 +1007,25 @@ def retrieve_worker(job_dir: Path, username: str, password: str):
                         pass
                 raise
             finally:
-                capture.save()
+                monitor.phase = "closing"
                 try:
                     browser.close()
                 except Exception:
                     pass
 
-        # ---------------- no browser from here on ----------------
-        job_log(job_dir, "=== BROWSER CLOSED === " + format_snapshot(collect_snapshot(dl_dir)))
-        monitor.phase = "api-download"
-        rep.running("Browser closed. Downloading the data directly from the API...", 0.45)
-        written = download_via_api(job_dir, export, part, monitor)
-        export = None  # drop credentials from memory
-        job_log(job_dir, f"API download finished: {written / 1048576:.1f} MB (decompressed JSON)")
-
-        capture_url = capture_export_url(capture)
-        structure = capture.structures.get(url_key(capture_url))
-        prefix = API_RECORDS_PATH or (structure or {}).get("prefix") or detect_prefix_from_file(part)
-        if not prefix:
-            raise RuntimeError("Could not find the list of alarm records inside the API response. "
-                               "See api_capture.json and set API_RECORDS_PATH.")
-        job_log(job_dir, f"Records path: {prefix}")
-
-        (job_dir / "source_meta.json").write_text(
-            json.dumps({"records_prefix": prefix, "export_url": url_key(capture_url), "bytes": written}), encoding="utf-8")
+        rep.running(f"Saving {len(all_rows):,} rows...", 0.97)
+        part = job_dir / "source.part"
+        with open(part, "w", encoding="utf-8") as fh:
+            json.dump({"records": all_rows}, fh, ensure_ascii=False)
+        write_json_atomic(job_dir / "source_meta.json", {
+            "records_prefix": "records.item", "rows": len(all_rows), "pages": pages, "api_pages": api_pages,
+            "range_start": start_d.isoformat(), "range_end": end_d.isoformat(),
+        })
         os.replace(part, source_path(job_dir))
         size_mb = source_path(job_dir).stat().st_size / 1024 / 1024
-        rep.done(f"Download complete: {size_mb:.1f} MB of alarm data saved on the server.",
-                 size_mb=round(size_mb, 1), records_prefix=prefix)
+        rep.done(f"Retrieved {len(all_rows):,} rows from {pages} pages "
+                 f"({start_d:%d-%m-%Y} to {end_d:%d-%m-%Y}).",
+                 size_mb=round(size_mb, 2), rows=len(all_rows), pages=pages)
     except Exception as exc:
         job_log(job_dir, traceback.format_exc(), "ERROR")
         if monitor is not None and monitor.tripped:
@@ -990,19 +1041,12 @@ def retrieve_worker(job_dir: Path, username: str, password: str):
                              f"peak Chromium RSS={monitor.peak_chromium:.0f}MB, "
                              f"memory guard tripped={'YES' if monitor.tripped else 'no'}")
         shutil.rmtree(dl_dir, ignore_errors=True)
-
-
-def capture_export_url(capture: ApiCapture) -> str:
-    for c in capture.calls:
-        if c["kind"] == "EXPORT":
-            return c["url"]
-    return ""
+        (job_dir / "source.part").unlink(missing_ok=True)
 
 
 # =====================================================================
-#  STEP 2 worker – streaming filter of the API JSON (low memory)
+#  STEP 2 worker – streaming filter of the collected rows (low memory)
 # =====================================================================
-WIB = timezone(timedelta(hours=SITE_UTC_OFFSET_HOURS))
 MAX_COLUMNS = 150
 _DATE_FORMATS = [
     "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
@@ -1037,7 +1081,7 @@ class DateParser:
             except Exception:
                 return None
         s = str(value).strip()
-        if not s:
+        if not s or s.lower().startswith("invalid"):
             return None
         if self.fmt:
             try:
@@ -1084,38 +1128,37 @@ def flatten(rec: dict, parent: str = "", out: dict = None) -> dict:
     return out
 
 
-_PREFERRED_DATE_FIELDS = ["created_at", "createdat", "date_created", "data_created", "created", "created_date",
+_PREFERRED_DATE_FIELDS = ["alarm_start_time", "start_time", "start_date", "started_at", "start_at", "start",
+                          "created_at", "createdat", "date_created", "data_created", "created", "created_date",
                           "createddate", "datetime_created", "create_at", "created_time"]
 
 
 def pick_date_field(columns, sample_rows, parser):
     if API_DATE_FIELD:
         if API_DATE_FIELD not in columns:
-            raise RuntimeError(f"API_DATE_FIELD '{API_DATE_FIELD}' not found. Available fields: {columns[:60]}")
+            raise RuntimeError(f"API_DATE_FIELD '{API_DATE_FIELD}' not found. Available columns: {columns[:60]}")
         return API_DATE_FIELD
     lower = {c: c.lower().replace(" ", "_") for c in columns}
     ordered = [c for pref in _PREFERRED_DATE_FIELDS for c in columns if lower[c].split(".")[-1] == pref]
-    ordered += [c for c in columns if "creat" in lower[c] and c not in ordered]
+    ordered += [c for c in columns if ("start" in lower[c] or "creat" in lower[c]) and c not in ordered]
     ordered += [c for c in columns if any(t in lower[c] for t in ("date", "time", "_at")) and c not in ordered]
     for col in ordered:
         vals = [r.get(col) for r in sample_rows if r.get(col) not in (None, "")][:200]
         if vals and sum(parser(v) is not None for v in vals) / len(vals) >= 0.8:
             return col
-    raise RuntimeError("Could not detect the creation-date field automatically. "
-                       f"Set API_DATE_FIELD at the top of app.py. Available fields: {columns[:60]}")
+    raise RuntimeError(
+        "No usable date column found. The site's table shows 'Invalid date' in Alarm Start Time and no real date "
+        "field could be read from the site's own data (see the [listing #n] lines in Diagnostics). "
+        f"Columns available: {columns[:40]}")
 
 
 def stream_filter_json(src: Path, dst: Path, year: int, month: int, prefix: str, on_progress):
-    """
-    Stream records from the API JSON (ijson) -> keep the chosen Year-Month -> write XLSX row by row.
-    Memory stays small even if the JSON is hundreds of MB.
-    """
     parser = DateParser()
     with open(src, "rb") as fh:
         records = ijson.items(fh, prefix, use_float=True)
         head = [flatten(r) for r in islice(records, 500)]
         if not head:
-            raise RuntimeError(f"No records found at path '{prefix}' in the downloaded JSON.")
+            raise RuntimeError(f"No records found at path '{prefix}' in the collected data.")
 
         columns, seen = [], set()
         for row in head:
@@ -1164,7 +1207,7 @@ def filter_worker(job_dir: Path, year: int, month: int):
     try:
         if not source_ready(job_dir):
             raise RuntimeError("Source data not found. Run Step 1 first.")
-        meta = json.loads((job_dir / "source_meta.json").read_text(encoding="utf-8"))
+        meta = read_source_meta(job_dir)
 
         for old in job_dir.glob("result_*.xlsx"):
             old.unlink(missing_ok=True)
@@ -1174,7 +1217,8 @@ def filter_worker(job_dir: Path, year: int, month: int):
         def progress(total, kept):
             rep.running(f"Filtering {label}: {total:,} records scanned, {kept:,} kept so far...", None, quiet=True)
 
-        stats = stream_filter_json(source_path(job_dir), part, year, month, meta["records_prefix"], progress)
+        stats = stream_filter_json(source_path(job_dir), part, year, month,
+                                   meta.get("records_prefix", "records.item"), progress)
         job_log(job_dir, f"[step 2] {stats['info']}")
 
         result_name = f"result_{year}-{month:02d}.xlsx"
@@ -1225,11 +1269,17 @@ def show_status(status: dict):
         st.error(f"❌ {msg}")
 
 
+def default_range():
+    """Last two months: the 1st of the previous month up to today (site time)."""
+    today = datetime.now(WIB).date()
+    prev_month_last_day = today.replace(day=1) - timedelta(days=1)
+    return prev_month_last_day.replace(day=1), today
+
+
 def render_workflow(job_dir: Path, job_id: str):
     s1, s2 = get_status(job_dir, 1), get_status(job_dir, 2)
     busy = s1["state"] == "running" or s2["state"] == "running"
 
-    # when a background step just finished, do one full rerun to stop polling
     was_busy = st.session_state.get("_was_busy", False)
     st.session_state["_was_busy"] = busy
     if was_busy and not busy:
@@ -1239,36 +1289,49 @@ def render_workflow(job_dir: Path, job_id: str):
 
     # ------------------------------------------------------------ STEP 1
     st.subheader("Step 1 · Retrieve Excel")
-    st.caption("Logs in, captures the Export API request (the heavy in-browser export is blocked), then downloads "
-               "the data directly from the PMT API. No filtering happens here.")
+    st.caption("Logs in, fills Start/End Date, shows 100 items per page and reads every page of the Closed Alarm "
+               "table one by one. No Download button is used. No filtering happens here.")
     if src_ok and s1["state"] != "running":
+        meta = read_source_meta(job_dir)
         size_mb = source_path(job_dir).stat().st_size / 1024 / 1024
-        st.success(f"✅ Source data is ready on the server ({size_mb:.1f} MB). No need to download again.")
+        rng = ""
+        if meta.get("range_start"):
+            rs, re_ = date.fromisoformat(meta["range_start"]), date.fromisoformat(meta["range_end"])
+            rng = f" · {rs:%d-%m-%Y} to {re_:%d-%m-%Y}"
+        st.success(f"✅ Source data is ready on the server: {meta.get('rows', '?'):,} rows from "
+                   f"{meta.get('pages', '?')} pages{rng} ({size_mb:.1f} MB). No need to retrieve again."
+                   if isinstance(meta.get("rows"), int) else
+                   f"✅ Source data is ready on the server ({size_mb:.1f} MB).")
     show_status(s1 if s1["state"] in ("running", "error") else {"state": "idle"})
     if s1["state"] == "error" and (job_dir / "error.png").exists():
         st.image(str(job_dir / "error.png"), caption="Browser screenshot when the error happened")
 
+    d0, d1 = default_range()
     with st.form("step1_form"):
         username = st.text_input("Username", disabled=busy)
         password = st.text_input("Password", type="password", disabled=busy)
-        force = st.checkbox("Replace the existing file (download again)", disabled=busy or not src_ok)
+        cs, ce = st.columns(2)
+        start_d = cs.date_input("Start date", value=d0, format="DD/MM/YYYY", disabled=busy, key="rng_start")
+        end_d = ce.date_input("End date", value=d1, format="DD/MM/YYYY", disabled=busy, key="rng_end")
+        force = st.checkbox("Replace the existing data (retrieve again)", disabled=busy or not src_ok)
         go1 = st.form_submit_button("Retrieve Excel", type="primary", disabled=busy, use_container_width=True)
 
     if go1:
         if src_ok and not force:
-            st.info("The source data already exists, so the download was skipped. "
-                    "Tick “Replace the existing file” to download a new copy.")
+            st.info("The source data already exists, so retrieving was skipped. "
+                    "Tick “Replace the existing data” to retrieve a new copy.")
         elif not username or not password:
             st.error("Please enter both username and password.")
+        elif start_d > end_d:
+            st.error("Start date must not be after end date.")
         else:
-            # a new source invalidates old step-2 results
             source_path(job_dir).unlink(missing_ok=True)
             (job_dir / "step2.json").unlink(missing_ok=True)
             (job_dir / "error.png").unlink(missing_ok=True)
             for old in job_dir.glob("result_*.xlsx"):
                 old.unlink(missing_ok=True)
             StepReporter(job_dir, 1).running("Queued...", 0.0)
-            start_thread(retrieve_worker, job_dir, username, password)
+            start_thread(retrieve_worker, job_dir, username, password, start_d, end_d)
             st.session_state["_was_busy"] = True
             st.rerun()
 
@@ -1276,7 +1339,8 @@ def render_workflow(job_dir: Path, job_id: str):
 
     # ------------------------------------------------------------ STEP 2
     st.subheader("Step 2 · Filter Excel")
-    st.caption("Streams the downloaded data and keeps only the chosen Year-Month, then builds the Excel file. Nothing is downloaded here.")
+    st.caption("Streams the collected rows and keeps only the chosen Year-Month, then builds the Excel file. "
+               "Nothing is downloaded here.")
     ready2 = src_ok and s1["state"] != "running"
 
     now = datetime.now()
@@ -1314,7 +1378,7 @@ def render_workflow(job_dir: Path, job_id: str):
             mime=XLSX_MIME,
             type="primary",
             use_container_width=True,
-            on_click="ignore",  # don't rerun the app when downloading
+            on_click="ignore",
         )
         st.caption(f"{s2['label']} · {result_path.stat().st_size / 1024 / 1024:.2f} MB")
     else:
@@ -1330,10 +1394,6 @@ def render_workflow(job_dir: Path, job_id: str):
         if all_lines:
             st.download_button("Download full log (job.log)", data="\n".join(all_lines),
                                file_name=f"job_{job_id}.log", mime="text/plain", on_click="ignore", key="dl_log")
-        cap_file = job_dir / "api_capture.json"
-        if cap_file.exists():
-            st.download_button("Download api_capture.json (redacted API discovery)", data=cap_file.read_bytes(),
-                               file_name="api_capture.json", mime="application/json", on_click="ignore", key="dl_cap")
         for shot in sorted(job_dir.glob("shot_*.png")):
             st.image(str(shot), caption=shot.stem)
     if st.button("🗑️ Delete my files & start over", disabled=busy):
@@ -1357,7 +1417,6 @@ def main():
     )
 
     busy = any(get_status(job_dir, s)["state"] == "running" for s in (1, 2))
-    # poll only while a background step is running
     st.fragment(run_every=POLL_SECONDS if busy else None)(render_workflow)(job_dir, job_id)
 
     st.caption("Your credentials are used only to start Step 1 and are never written to disk or logs.")
