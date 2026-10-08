@@ -1,16 +1,18 @@
 """
-PMT Alarm – Closed Alarm downloader (3-step workflow, Playwright edition)
+PMT Alarm – Closed Alarm downloader (2 visible steps, Playwright edition)
 
-STEP 1  Retrieve Excel  -> login in Chromium, set Start/End Date, set 100 items per page,
-                           then walk through every page of the CLOSED ALARM table and collect the rows
-                           (no Download button, no export API call)
-STEP 2  Filter Excel    -> stream the collected rows, keep the chosen Year-Month, write XLSX
-STEP 3  Download Result -> hand the processed XLSX to the browser (no processing)
+STEP 1  Retrieve   -> login in Chromium, open CLOSED ALARM, fill Start/End Date, Apply, set Items per page (500),
+                      then for every page: Download Alarm > By Page (one file per page), click next page, repeat.
+                      All page files are compiled into ONE Excel file.
+STEP 3  Download   -> hand the compiled XLSX to the browser (no processing)
 
 All state lives on disk in a per-session job folder (not only in st.session_state),
 so it survives websocket reconnects and page refreshes (the job id is kept in the URL).
 """
+import csv
 import faulthandler
+import hashlib
+import io
 import json
 import logging
 import os
@@ -24,15 +26,12 @@ import time
 import traceback
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from itertools import chain, islice
 from pathlib import Path
 
 import streamlit as st
-import ijson
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
-from openpyxl.utils.datetime import from_excel
 from playwright.sync_api import Error as PWError
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
@@ -47,7 +46,7 @@ LOGIN_URL = "https://pmt-alarm.komdigi.go.id/auth/login"
 ALARM_URL = "https://pmt-alarm.komdigi.go.id/dashboard/alarm"
 DEFAULT_TIMEOUT = 40          # seconds for normal waits
 JOBS_ROOT = Path(tempfile.gettempdir()) / "pmt_alarm_jobs"
-STALE_AFTER = 300             # a "running" step with no heartbeat for 5 min = interrupted
+STALE_AFTER = 600             # a "running" step with no heartbeat for 5 min = interrupted
 JOB_MAX_AGE_HOURS = 12
 POLL_SECONDS = 3
 MEM_GUARD_FRACTION = 0.85     # kill Chromium when the container reaches 85 % of its memory limit
@@ -57,17 +56,10 @@ BLOCK_IMAGES = True
 
 SITE_UTC_OFFSET_HOURS = 7     # the site works in WIB (UTC+7)
 DATE_INPUT_FORMAT = "%d-%m-%Y"        # how the Start/End Date boxes display dates (02-10-2026)
-PAGE_SIZE_CHOICES = ("100", "50", "20")  # tried in this order in the "Items" dropdown
+PAGE_SIZE_CHOICES = ("500", "100", "50")  # tried in this order in the "Items" dropdown
 MAX_PAGES = 3000              # safety cap for the pagination loop
+DOWNLOAD_TIMEOUT = 240        # seconds to wait for ONE "By Page" file
 
-# ---- optional: the site's own listing API (only READ from the browser traffic, never replayed) ----
-API_HOST = "pmt-api.komdigi.go.id"
-API_DATE_FIELD = None         # force the date column used by Step 2, e.g. "Alarm Start Time" or "api.created_at"
-COLUMN_LABELS = {}            # e.g. {"api.created_at": "Created At"} to rename Excel headers
-MONTHS = [
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
-]
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 # =========================================================
 
@@ -151,21 +143,6 @@ def cleanup_old_jobs():
         except OSError:
             pass
 
-
-def source_path(job_dir: Path) -> Path:
-    return job_dir / "source.json"
-
-
-def source_ready(job_dir: Path) -> bool:
-    p = source_path(job_dir)
-    return p.exists() and p.stat().st_size > 0
-
-
-def read_source_meta(job_dir: Path) -> dict:
-    try:
-        return json.loads((job_dir / "source_meta.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
 
 
 # =====================================================================
@@ -838,96 +815,12 @@ def pw_set_page_size(page, job_dir: Path):
 
 
 # =====================================================================
-#  Optional: read the site's own listing API traffic (for real dates)
+#  Download Alarm > By Page  (one file per page)
 # =====================================================================
-def find_records_path(obj, max_depth=6):
-    """Return (path, records): the biggest list of dicts inside a JSON document."""
-    best = ([], [])
-
-    def walk(o, path, depth):
-        nonlocal best
-        if depth > max_depth:
-            return
-        if isinstance(o, list):
-            if o and isinstance(o[0], dict) and len(o) > len(best[1]):
-                best = (list(path), o)
-        elif isinstance(o, dict):
-            for k, v in o.items():
-                walk(v, path + [str(k)], depth + 1)
-
-    walk(obj, [], 0)
-    return best
+BY_PAGE_XPATH = (f"xpath=//*[(self::button or self::a or self::li or self::span or self::div "
+                 f"or @role='menuitem') and {UPPER}='BY PAGE']")
 
 
-class ListingCapture:
-    """
-    Passively remembers the JSON the site's own table requests receive (small: one page each).
-    Nothing is replayed and nothing is stored on disk. It is used to add real date fields to the
-    scraped rows, because the table shows 'Invalid date' in the Alarm Start Time column.
-    """
-
-    def __init__(self, job_dir: Path):
-        self.job_dir = job_dir
-        self.items = []
-        self.n = 0
-
-    def attach(self, page):
-        page.on("response", self._guard(self._on_response))
-
-    @staticmethod
-    def _guard(fn):
-        def wrapper(*args):
-            try:
-                fn(*args)
-            except Exception:
-                pass
-        return wrapper
-
-    def _on_response(self, resp):
-        req = resp.request
-        if API_HOST not in resp.url or req.resource_type not in ("xhr", "fetch") or resp.status != 200:
-            return
-        if "json" not in resp.headers.get("content-type", ""):
-            return
-        if int(resp.headers.get("content-length", "0") or 0) > 8_000_000:
-            return
-        data = json.loads(resp.body())
-        path, recs = find_records_path(data)
-        if not recs:
-            return
-        self.n += 1
-        self.items.append({"t": time.time(), "url": resp.url.split("?")[0], "records": recs})
-        del self.items[:-8]
-        if self.n <= 12:
-            flat_first = flatten(recs[0])
-            job_log(self.job_dir, f"[listing #{self.n}] {resp.url.split('?')[0][-70:]} path={'.'.join(path) or '(root)'} "
-                                  f"records={len(recs)} fields={list(flat_first.keys())[:40]}")
-
-
-API_EXTRA_KEY_RE = re.compile(r"date|time|_at$|^at$|creat|updat|start|clos|end$|resolv", re.I)
-
-
-def match_api(listing: ListingCapture, since: float, rows):
-    """Find the captured API page that corresponds to the rows currently shown. Returns list of flat dicts or None."""
-    if not rows:
-        return None
-
-    def overlap(cells, flat):
-        vals = {str(v).strip() for v in flat.values() if v is not None}
-        return sum(1 for c in cells if len(c) > 2 and c in vals)
-
-    for item in reversed(listing.items):
-        if item["t"] < since - 0.5 or len(item["records"]) != len(rows):
-            continue
-        flats = [flatten(r) for r in item["records"]]
-        if overlap(rows[0], flats[0]) >= 2 and overlap(rows[-1], flats[-1]) >= 2:
-            return flats
-    return None
-
-
-# =====================================================================
-#  Page-by-page scraping
-# =====================================================================
 def find_next(page):
     handle = page.evaluate_handle(FIND_NEXT_JS)
     el = handle.as_element()
@@ -936,34 +829,70 @@ def find_next(page):
     return el, bool(el.evaluate(IS_DISABLED_JS))
 
 
-def scrape_all_pages(page, job_dir: Path, rep: StepReporter, listing: ListingCapture, monitor, browser, since: float):
-    all_rows, page_no, api_pages = [], 0, 0
-    headers, rows = read_table(page)
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def pw_download_by_page(page, job_dir: Path, dest_base: Path) -> Path:
+    """Open 'Download Alarm', click 'By Page', and save the file the browser downloads."""
+    last_exc = None
+    for attempt in (1, 2, 3):
+        try:
+            try:
+                page.keyboard.press("Escape")  # make sure no old menu is open
+            except PWError:
+                pass
+            with page.expect_download(timeout=DOWNLOAD_TIMEOUT * 1000) as info:
+                safe_click(first_visible(page, f"xpath=//button[contains({UPPER}, 'DOWNLOAD ALARM')]", 20))
+                page.wait_for_timeout(600)
+                safe_click(first_visible(page, BY_PAGE_XPATH, 15))
+            dl = info.value
+            failure = dl.failure()
+            if failure:
+                raise RuntimeError(f"browser download failed: {failure}")
+            ext = Path(dl.suggested_filename or "").suffix.lower() or ".xlsx"
+            dest = Path(f"{dest_base}{ext}")
+            dl.save_as(str(dest))
+            if not dest.exists() or dest.stat().st_size == 0:
+                raise RuntimeError("the downloaded file is empty")
+            return dest
+        except (PWError, RuntimeError) as exc:
+            last_exc = exc
+            job_log(job_dir, f"By Page download attempt {attempt} failed: {str(exc)[:200]}", "WARNING")
+            page.wait_for_timeout(2000)
+    raise RuntimeError(f"Download Alarm > By Page failed 3 times: {str(last_exc)[:200]}")
+
+
+def download_all_pages(page, job_dir: Path, pages_dir: Path, rep: StepReporter, monitor, browser):
+    files, seen_hashes, page_no = [], {}, 0
+    _, rows = read_table(page)
     if not rows:
         raise RuntimeError("The table is empty for this date range (no closed alarms found).")
     total_pages = max(1, page.evaluate(TOTAL_PAGES_JS))
 
     while True:
         page_no += 1
-        flats = match_api(listing, since, rows)
-        if flats:
-            api_pages += 1
-        for i, cells in enumerate(rows):
-            rec = dict(zip(headers, cells))
-            if flats:
-                for k, v in flats[i].items():
-                    if API_EXTRA_KEY_RE.search(k) and not isinstance(v, (dict, list)):
-                        rec[f"api.{k}"] = v
-            all_rows.append(rec)
-
         total_pages = max(total_pages, page_no, page.evaluate(TOTAL_PAGES_JS))
-        rep.running(f"Scraping page {page_no} of ~{total_pages}: {len(all_rows):,} rows collected...",
-                    0.40 + 0.55 * min(page_no / total_pages, 1.0))
+        rep.running(f"Page {page_no} of ~{total_pages}: downloading 'By Page' ({len(rows)} rows on screen)...",
+                    0.40 + 0.50 * min((page_no - 1) / total_pages, 1.0))
+        dest = pw_download_by_page(page, job_dir, pages_dir / f"page_{page_no:04d}")
+        digest = file_sha256(dest)
+        if digest in seen_hashes:
+            job_log(job_dir, f"Page {page_no}: the file is identical to page {seen_hashes[digest]}; skipped.", "WARNING")
+            dest.unlink(missing_ok=True)
+        else:
+            seen_hashes[digest] = page_no
+            files.append(dest)
+            job_log(job_dir, f"Page {page_no}: saved {dest.name} ({dest.stat().st_size / 1024:.0f} KB)")
 
         if monitor is not None and monitor.tripped:
             raise RuntimeError(monitor.tripped)
         if not browser.is_connected() or page.is_closed():
-            raise RuntimeError("Chromium exited while scraping the table.")
+            raise RuntimeError("Chromium exited while downloading pages.")
         if page_no >= MAX_PAGES:
             job_log(job_dir, f"Reached the safety cap of {MAX_PAGES} pages.", "WARNING")
             break
@@ -977,7 +906,6 @@ def scrape_all_pages(page, job_dir: Path, rep: StepReporter, listing: ListingCap
             break
 
         old = table_sig(rows)
-        since = time.time()
         changed = False
         for attempt in (1, 2):
             safe_click(nxt)
@@ -991,22 +919,131 @@ def scrape_all_pages(page, job_dir: Path, rep: StepReporter, listing: ListingCap
         if not changed:
             job_log(job_dir, "Table stopped changing: assuming the last page was reached.")
             break
-        headers, rows = read_table(page)
+        _, rows = read_table(page)
         if not rows:
             break
-
-    return all_rows, page_no, api_pages
+    return files, page_no
 
 
 # =====================================================================
-#  STEP 1 worker – set filters, then walk through every page
+#  Compile all page files into one workbook
+# =====================================================================
+def _iter_xlsx(path: Path):
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        for row in wb.worksheets[0].iter_rows(values_only=True):
+            yield list(row)
+    finally:
+        wb.close()
+
+
+def _iter_csv(path: Path):
+    raw = path.read_bytes()
+    text = None
+    for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeError:
+            continue
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+    yield from csv.reader(io.StringIO(text), dialect)
+
+
+def iter_file_rows(path: Path):
+    ext = path.suffix.lower()
+    if ext == ".xls":
+        raise RuntimeError("The site returned an old .xls file, which this app cannot read. "
+                           "Install xlrd or ask me to add .xls support.")
+    if ext in (".csv", ".txt"):
+        return _iter_csv(path)
+    return _iter_xlsx(path)
+
+
+def split_header(rows_iter):
+    """First row with at least 3 filled cells is the header. Returns (header_list, rest_iterator)."""
+    for row in rows_iter:
+        vals = ["" if c is None else str(c).strip() for c in row]
+        if sum(1 for v in vals if v) >= 3:
+            return vals, rows_iter
+    return None, rows_iter
+
+
+def unique_names(header):
+    seen, out = {}, []
+    for i, h in enumerate(header):
+        h = h or f"col_{i + 1}"
+        n = seen.get(h, 0)
+        seen[h] = n + 1
+        out.append(h if n == 0 else f"{h}_{n + 1}")
+    return out
+
+
+def compile_files(files, out_path: Path, job_dir: Path, rep: StepReporter) -> int:
+    """Merge every page file into one XLSX (columns matched by header name). Returns the row count."""
+    master, seen, headers = [], set(), []
+    for f in files:                                   # pass 1: collect the columns
+        gen = iter_file_rows(f)
+        header, _ = split_header(gen)
+        if hasattr(gen, "close"):
+            gen.close()
+        if header is None:
+            raise RuntimeError(f"Could not find a header row in {f.name}.")
+        names = unique_names(header)
+        headers.append(names)
+        for n in names:
+            if n not in seen:
+                seen.add(n)
+                master.append(n)
+
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("Closed Alarm")
+    ws.freeze_panes = "A2"
+    for i, label in enumerate(master, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = min(max(len(label) + 4, 14), 40)
+    ws.append(master)
+
+    total = 0
+    for idx, f in enumerate(files):                   # pass 2: write the rows
+        names = headers[idx]
+        pos = {n: i for i, n in enumerate(names)}
+        order = [pos.get(m) for m in master]
+        gen = iter_file_rows(f)
+        _, rest = split_header(gen)
+        count = 0
+        for row in rest:
+            if not any(c not in (None, "") for c in row):
+                continue
+            out = []
+            for p in order:
+                v = row[p] if p is not None and p < len(row) else None
+                out.append(ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v)
+            ws.append(out)
+            count += 1
+        if hasattr(gen, "close"):
+            gen.close()
+        total += count
+        job_log(job_dir, f"Compiled {f.name}: {count:,} rows")
+        rep.running(f"Compiling files into one Excel: {idx + 1}/{len(files)} done, {total:,} rows so far...",
+                    0.90 + 0.08 * (idx + 1) / len(files), quiet=True)
+    wb.save(out_path)
+    return total
+
+
+# =====================================================================
+#  STEP 1 worker – filters, per-page downloads, compile
 # =====================================================================
 def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, end_d: date):
     rep = StepReporter(job_dir, 1)
     dl_dir = job_dir / "dl"
-    shutil.rmtree(dl_dir, ignore_errors=True)
-    dl_dir.mkdir(parents=True, exist_ok=True)
-    for pattern in ("shot_*.png", "source_meta.json", "error.png", "source.part"):
+    pages_dir = job_dir / "pages"
+    for d in (dl_dir, pages_dir):
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True, exist_ok=True)
+    for pattern in ("shot_*.png", "error.png", "result_*.xlsx", "result.part"):
         for old in job_dir.glob(pattern):
             old.unlink(missing_ok=True)
 
@@ -1022,7 +1059,7 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
             browser = launch_browser(pw, job_dir, dl_dir)
             page = None
             try:
-                context = browser.new_context(accept_downloads=False, viewport={"width": 1600, "height": 1000})
+                context = browser.new_context(accept_downloads=True, viewport={"width": 1600, "height": 1000})
                 if BLOCK_IMAGES:
                     context.route(
                         "**/*",
@@ -1033,49 +1070,40 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
                 page = context.new_page()
                 page.set_default_timeout(DEFAULT_TIMEOUT * 1000)
                 attach_diagnostics(job_dir, browser, page)
-                listing = ListingCapture(job_dir)
-                listing.attach(page)
 
                 monitor.phase = "login"
                 rep.running("Logging in...", 0.10)
                 pw_login(page, username, password)
 
                 monitor.phase = "alarm-page"
-                rep.running("Opening alarm page...", 0.18)
+                rep.running("Opening alarm page...", 0.16)
                 pw_open_alarm_page(page)
                 pw_scroll_to_alarm_section(page)
 
-                rep.running("Opening CLOSED ALARM tab...", 0.22)
+                rep.running("Opening CLOSED ALARM tab...", 0.20)
                 pw_click_closed_alarm_tab(page, job_dir)
                 take_shot(page, job_dir, "shot_0_closed_alarm_tab")
 
                 monitor.phase = "filters"
-                rep.running(f"Setting Start Date {start_d:%d-%m-%Y} and End Date {end_d:%d-%m-%Y}...", 0.26)
+                rep.running(f"Setting Start Date {start_d:%d-%m-%Y} and End Date {end_d:%d-%m-%Y}...", 0.24)
                 pw_set_date(page, job_dir, "Start Date", start_d)
                 pw_set_date(page, job_dir, "End Date", end_d)
                 take_shot(page, job_dir, "shot_1_filters")
 
                 _, rows_before = read_table(page)
-                since = time.time()
-                rep.running("Applying the filter...", 0.30)
+                rep.running("Applying the filter...", 0.28)
                 pw_click_apply(page)
                 wait_table_change(page, table_sig(rows_before), 25)
                 wait_loading_done(page)
                 page.wait_for_timeout(800)
 
-                rep.running("Setting items per page...", 0.34)
+                rep.running("Setting items per page...", 0.33)
                 pw_set_page_size(page, job_dir)
                 take_shot(page, job_dir, "shot_2_after_page_size")
 
-                monitor.phase = "scrape"
-                rep.running("Reading the table page by page...", 0.40)
-                all_rows, pages, api_pages = scrape_all_pages(page, job_dir, rep, listing, monitor, browser, since)
-                job_log(job_dir, f"Scraped {len(all_rows):,} rows from {pages} pages "
-                                 f"(real API dates attached on {api_pages} of {pages} pages).")
-                if api_pages == 0:
-                    job_log(job_dir, "No API date fields could be attached. If the Alarm Start Time column says "
-                                     "'Invalid date', Step 2 will not be able to filter by month. "
-                                     "See the [listing #n] lines above.", "WARNING")
+                monitor.phase = "download-pages"
+                rep.running("Downloading page by page...", 0.40)
+                files, pages = download_all_pages(page, job_dir, pages_dir, rep, monitor, browser)
                 take_shot(page, job_dir, "shot_3_last_page")
             except Exception:
                 job_log(job_dir, "State at failure: " + format_snapshot(collect_snapshot(dl_dir)), "ERROR")
@@ -1092,19 +1120,19 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
                 except Exception:
                     pass
 
-        rep.running(f"Saving {len(all_rows):,} rows...", 0.97)
-        part = job_dir / "source.part"
-        with open(part, "w", encoding="utf-8") as fh:
-            json.dump({"records": all_rows}, fh, ensure_ascii=False)
-        write_json_atomic(job_dir / "source_meta.json", {
-            "records_prefix": "records.item", "rows": len(all_rows), "pages": pages, "api_pages": api_pages,
-            "range_start": start_d.isoformat(), "range_end": end_d.isoformat(),
-        })
-        os.replace(part, source_path(job_dir))
-        size_mb = source_path(job_dir).stat().st_size / 1024 / 1024
-        rep.done(f"Retrieved {len(all_rows):,} rows from {pages} pages "
-                 f"({start_d:%d-%m-%Y} to {end_d:%d-%m-%Y}).",
-                 size_mb=round(size_mb, 2), rows=len(all_rows), pages=pages)
+        if not files:
+            raise RuntimeError("No page files were downloaded.")
+        monitor.phase = "compile"
+        rep.running(f"Compiling {len(files)} downloaded files into one Excel...", 0.90)
+        result_name = f"closed_alarm_{start_d:%Y%m%d}_{end_d:%Y%m%d}.xlsx"
+        part = job_dir / "result.part"
+        total_rows = compile_files(files, part, job_dir, rep)
+        os.replace(part, job_dir / result_name)
+        size_mb = (job_dir / result_name).stat().st_size / 1024 / 1024
+        rep.done(f"Compiled {total_rows:,} rows from {len(files)} page files "
+                 f"({start_d:%d-%m-%Y} to {end_d:%d-%m-%Y}, {size_mb:.1f} MB).",
+                 result_file=result_name, rows=total_rows, pages=len(files),
+                 range_start=start_d.isoformat(), range_end=end_d.isoformat())
     except Exception as exc:
         job_log(job_dir, traceback.format_exc(), "ERROR")
         if monitor is not None and monitor.tripped:
@@ -1120,199 +1148,8 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
                              f"peak Chromium RSS={monitor.peak_chromium:.0f}MB, "
                              f"memory guard tripped={'YES' if monitor.tripped else 'no'}")
         shutil.rmtree(dl_dir, ignore_errors=True)
-        (job_dir / "source.part").unlink(missing_ok=True)
-
-
-# =====================================================================
-#  STEP 2 worker – streaming filter of the collected rows (low memory)
-# =====================================================================
-MAX_COLUMNS = 150
-_DATE_FORMATS = [
-    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
-    "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M", "%d/%m/%Y", "%d-%m-%Y",
-]
-
-
-def _to_site_time(dt: datetime) -> datetime:
-    return dt.astimezone(WIB).replace(tzinfo=None) if dt.tzinfo is not None else dt
-
-
-class DateParser:
-    """Row-by-row date parsing: ISO (with timezone), epoch s/ms, Excel serials, d/m/Y text."""
-
-    def __init__(self):
-        self.fmt = None
-
-    def __call__(self, value):
-        if value is None or isinstance(value, bool):
-            return None
-        if isinstance(value, datetime):
-            return _to_site_time(value)
-        if isinstance(value, date):
-            return datetime(value.year, value.month, value.day)
-        if isinstance(value, (int, float)):
-            try:
-                if value > 1e11:
-                    return datetime.fromtimestamp(value / 1000, tz=WIB).replace(tzinfo=None)
-                if value > 1e8:
-                    return datetime.fromtimestamp(value, tz=WIB).replace(tzinfo=None)
-                return from_excel(value)
-            except Exception:
-                return None
-        s = str(value).strip()
-        if not s or s.lower().startswith("invalid"):
-            return None
-        if self.fmt:
-            try:
-                return datetime.strptime(s, self.fmt)
-            except ValueError:
-                pass
-        if "T" in s or s.endswith("Z"):
-            try:
-                return _to_site_time(datetime.fromisoformat(s.replace("Z", "+00:00")))
-            except ValueError:
-                pass
-        for fmt in _DATE_FORMATS:
-            try:
-                parsed = datetime.strptime(s, fmt)
-                self.fmt = fmt
-                return parsed
-            except ValueError:
-                continue
-        try:
-            import pandas as pd
-
-            iso = len(s) >= 5 and s[:4].isdigit() and s[4] in "-/"
-            ts = pd.to_datetime(s, errors="coerce", dayfirst=not iso)
-            return None if pd.isna(ts) else ts.to_pydatetime()
-        except Exception:
-            return None
-
-
-def _clean(v):
-    return ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v
-
-
-def flatten(rec: dict, parent: str = "", out: dict = None) -> dict:
-    if out is None:
-        out = {}
-    for k, v in rec.items():
-        key = f"{parent}.{k}" if parent else str(k)
-        if isinstance(v, dict):
-            flatten(v, key, out)
-        elif isinstance(v, list):
-            out[key] = json.dumps(v, ensure_ascii=False)
-        else:
-            out[key] = v
-    return out
-
-
-_PREFERRED_DATE_FIELDS = ["alarm_start_time", "start_time", "start_date", "started_at", "start_at", "start",
-                          "created_at", "createdat", "date_created", "data_created", "created", "created_date",
-                          "createddate", "datetime_created", "create_at", "created_time"]
-
-
-def pick_date_field(columns, sample_rows, parser):
-    if API_DATE_FIELD:
-        if API_DATE_FIELD not in columns:
-            raise RuntimeError(f"API_DATE_FIELD '{API_DATE_FIELD}' not found. Available columns: {columns[:60]}")
-        return API_DATE_FIELD
-    lower = {c: c.lower().replace(" ", "_") for c in columns}
-    ordered = [c for pref in _PREFERRED_DATE_FIELDS for c in columns if lower[c].split(".")[-1] == pref]
-    ordered += [c for c in columns if ("start" in lower[c] or "creat" in lower[c]) and c not in ordered]
-    ordered += [c for c in columns if any(t in lower[c] for t in ("date", "time", "_at")) and c not in ordered]
-    for col in ordered:
-        vals = [r.get(col) for r in sample_rows if r.get(col) not in (None, "")][:200]
-        if vals and sum(parser(v) is not None for v in vals) / len(vals) >= 0.8:
-            return col
-    raise RuntimeError(
-        "No usable date column found. The site's table shows 'Invalid date' in Alarm Start Time and no real date "
-        "field could be read from the site's own data (see the [listing #n] lines in Diagnostics). "
-        f"Columns available: {columns[:40]}")
-
-
-def stream_filter_json(src: Path, dst: Path, year: int, month: int, prefix: str, on_progress):
-    parser = DateParser()
-    with open(src, "rb") as fh:
-        records = ijson.items(fh, prefix, use_float=True)
-        head = [flatten(r) for r in islice(records, 500)]
-        if not head:
-            raise RuntimeError(f"No records found at path '{prefix}' in the collected data.")
-
-        columns, seen = [], set()
-        for row in head:
-            for key in row:
-                if key not in seen:
-                    seen.add(key)
-                    columns.append(key)
-        columns = columns[:MAX_COLUMNS]
-        date_field = pick_date_field(columns, head, parser)
-        date_idx = columns.index(date_field)
-        job_log_hint = f"columns={len(columns)} date_field={date_field}"
-
-        wb_out = Workbook(write_only=True)
-        ws_out = wb_out.create_sheet("Closed Alarm")
-        ws_out.freeze_panes = "A2"
-        labels = [COLUMN_LABELS.get(c, c) for c in columns]
-        for i, label in enumerate(labels, start=1):
-            ws_out.column_dimensions[get_column_letter(i)].width = min(max(len(label) + 4, 14), 40)
-        ws_out.append(labels)
-
-        total = kept = invalid = 0
-        last_report = time.time()
-        all_rows = chain(head, (flatten(r) for r in records))
-        for flat in all_rows:
-            total += 1
-            dt = parser(flat.get(date_field))
-            if dt is None:
-                invalid += 1
-            elif dt.year == year and dt.month == month:
-                row = [_clean(flat.get(c)) for c in columns]
-                row[date_idx] = dt
-                ws_out.append(row)
-                kept += 1
-            if total % 2000 == 0 and time.time() - last_report >= 2:
-                last_report = time.time()
-                on_progress(total, kept)
-
-        wb_out.save(dst)
-    return {"total": total, "kept": kept, "invalid": invalid, "date_col": date_field, "info": job_log_hint}
-
-
-def filter_worker(job_dir: Path, year: int, month: int):
-    rep = StepReporter(job_dir, 2)
-    label = f"{MONTHS[month - 1]} {year}"
-    part = job_dir / "result.part"
-    try:
-        if not source_ready(job_dir):
-            raise RuntimeError("Source data not found. Run Step 1 first.")
-        meta = read_source_meta(job_dir)
-
-        for old in job_dir.glob("result_*.xlsx"):
-            old.unlink(missing_ok=True)
-
-        rep.running(f"Reading source data and filtering for {label}...", None)
-
-        def progress(total, kept):
-            rep.running(f"Filtering {label}: {total:,} records scanned, {kept:,} kept so far...", None, quiet=True)
-
-        stats = stream_filter_json(source_path(job_dir), part, year, month,
-                                   meta.get("records_prefix", "records.item"), progress)
-        job_log(job_dir, f"[step 2] {stats['info']}")
-
-        result_name = f"result_{year}-{month:02d}.xlsx"
-        os.replace(part, job_dir / result_name)
-        stats.pop("info", None)
-        rep.done(
-            f"Filtering complete for {label}: {stats['kept']:,} of {stats['total']:,} records kept "
-            f"(date field: {stats['date_col']}).",
-            result_file=result_name, label=label, year=year, month=month, **stats,
-        )
-    except Exception as exc:
-        job_log(job_dir, traceback.format_exc(), "ERROR")
-        rep.fail(str(exc) or type(exc).__name__)
-    finally:
-        part.unlink(missing_ok=True)
+        shutil.rmtree(pages_dir, ignore_errors=True)
+        (job_dir / "result.part").unlink(missing_ok=True)
 
 
 # =====================================================================
@@ -1356,32 +1193,22 @@ def default_range():
 
 
 def render_workflow(job_dir: Path, job_id: str):
-    s1, s2 = get_status(job_dir, 1), get_status(job_dir, 2)
-    busy = s1["state"] == "running" or s2["state"] == "running"
+    s1 = get_status(job_dir, 1)
+    busy = s1["state"] == "running"
 
     was_busy = st.session_state.get("_was_busy", False)
     st.session_state["_was_busy"] = busy
     if was_busy and not busy:
         st.rerun()
 
-    src_ok = source_ready(job_dir)
+    result_path = job_dir / s1["result_file"] if s1.get("state") == "done" and s1.get("result_file") else None
+    result_ok = result_path is not None and result_path.exists()
 
     # ------------------------------------------------------------ STEP 1
-    st.subheader("Step 1 · Retrieve Excel")
-    st.caption("Logs in, fills Start/End Date, shows 100 items per page and reads every page of the Closed Alarm "
-               "table one by one. No Download button is used. No filtering happens here.")
-    if src_ok and s1["state"] != "running":
-        meta = read_source_meta(job_dir)
-        size_mb = source_path(job_dir).stat().st_size / 1024 / 1024
-        rng = ""
-        if meta.get("range_start"):
-            rs, re_ = date.fromisoformat(meta["range_start"]), date.fromisoformat(meta["range_end"])
-            rng = f" · {rs:%d-%m-%Y} to {re_:%d-%m-%Y}"
-        st.success(f"✅ Source data is ready on the server: {meta.get('rows', '?'):,} rows from "
-                   f"{meta.get('pages', '?')} pages{rng} ({size_mb:.1f} MB). No need to retrieve again."
-                   if isinstance(meta.get("rows"), int) else
-                   f"✅ Source data is ready on the server ({size_mb:.1f} MB).")
-    show_status(s1 if s1["state"] in ("running", "error") else {"state": "idle"})
+    st.subheader("Step 1 · Retrieve closed alarms")
+    st.caption("Logs in, opens CLOSED ALARM, fills Start/End Date, sets 500 items per page, then clicks "
+               "Download Alarm › By Page on every page and compiles all files into one Excel.")
+    show_status(s1)
     if s1["state"] == "error" and (job_dir / "error.png").exists():
         st.image(str(job_dir / "error.png"), caption="Browser screenshot when the error happened")
 
@@ -1392,22 +1219,20 @@ def render_workflow(job_dir: Path, job_id: str):
         cs, ce = st.columns(2)
         start_d = cs.date_input("Start date", value=d0, format="DD/MM/YYYY", disabled=busy, key="rng_start")
         end_d = ce.date_input("End date", value=d1, format="DD/MM/YYYY", disabled=busy, key="rng_end")
-        force = st.checkbox("Replace the existing data (retrieve again)", disabled=busy or not src_ok)
-        go1 = st.form_submit_button("Retrieve Excel", type="primary", disabled=busy, use_container_width=True)
+        force = st.checkbox("Replace the existing result (retrieve again)", disabled=busy or not result_ok)
+        go1 = st.form_submit_button("Retrieve closed alarms", type="primary", disabled=busy, use_container_width=True)
 
     if go1:
-        if src_ok and not force:
-            st.info("The source data already exists, so retrieving was skipped. "
-                    "Tick “Replace the existing data” to retrieve a new copy.")
+        if result_ok and not force:
+            st.info("A compiled result already exists, so retrieving was skipped. "
+                    "Tick “Replace the existing result” to retrieve a new copy.")
         elif not username or not password:
             st.error("Please enter both username and password.")
         elif start_d > end_d:
             st.error("Start date must not be after end date.")
         else:
-            source_path(job_dir).unlink(missing_ok=True)
-            (job_dir / "step2.json").unlink(missing_ok=True)
             (job_dir / "error.png").unlink(missing_ok=True)
-            for old in job_dir.glob("result_*.xlsx"):
+            for old in job_dir.glob("closed_alarm_*.xlsx"):
                 old.unlink(missing_ok=True)
             StepReporter(job_dir, 1).running("Queued...", 0.0)
             start_thread(retrieve_worker, job_dir, username, password, start_d, end_d)
@@ -1416,53 +1241,27 @@ def render_workflow(job_dir: Path, job_id: str):
 
     st.divider()
 
-    # ------------------------------------------------------------ STEP 2
-    st.subheader("Step 2 · Filter Excel")
-    st.caption("Streams the collected rows and keeps only the chosen Year-Month, then builds the Excel file. "
-               "Nothing is downloaded here.")
-    ready2 = src_ok and s1["state"] != "running"
-
-    now = datetime.now()
-    years = list(range(now.year, 2019, -1))
-    c1, c2 = st.columns(2)
-    year = c1.selectbox("Year", years, key="sel_year", disabled=not ready2 or busy)
-    month_name = c2.selectbox("Month", MONTHS, index=now.month - 1, key="sel_month", disabled=not ready2 or busy)
-
-    if not ready2:
-        st.caption("🔒 Complete Step 1 first.")
-    go2 = st.button("Filter Excel", type="primary", disabled=(not ready2) or busy, use_container_width=True)
-    if go2:
-        for old in job_dir.glob("result_*.xlsx"):
-            old.unlink(missing_ok=True)
-        StepReporter(job_dir, 2).running("Queued...", 0.0)
-        start_thread(filter_worker, job_dir, int(year), MONTHS.index(month_name) + 1)
-        st.session_state["_was_busy"] = True
-        st.rerun()
-
-    show_status(s2)
-    if s2["state"] == "done" and s2.get("invalid"):
-        st.warning(f"{s2['invalid']:,} rows had an empty/unreadable date and were excluded.")
-
-    st.divider()
-
     # ------------------------------------------------------------ STEP 3
     st.subheader("Step 3 · Download Result")
-    st.caption("Just hands you the processed file from Step 2. No processing happens here.")
-    result_path = job_dir / s2["result_file"] if s2.get("state") == "done" and s2.get("result_file") else None
-    if result_path is not None and result_path.exists():
+    st.caption("Just hands you the compiled file from Step 1. No processing happens here.")
+    if result_ok:
+        rs, re_ = s1.get("range_start"), s1.get("range_end")
         st.download_button(
             "Download Result",
             data=result_path.read_bytes(),
-            file_name=f"PMT_Alarm_Closed_{s2['year']}-{int(s2['month']):02d}.xlsx",
+            file_name=result_path.name,
             mime=XLSX_MIME,
             type="primary",
             use_container_width=True,
             on_click="ignore",
         )
-        st.caption(f"{s2['label']} · {result_path.stat().st_size / 1024 / 1024:.2f} MB")
+        st.caption(f"{s1.get('rows', '?'):,} rows · {s1.get('pages', '?')} pages · "
+                   f"{result_path.stat().st_size / 1024 / 1024:.2f} MB"
+                   + (f" · {date.fromisoformat(rs):%d-%m-%Y} to {date.fromisoformat(re_):%d-%m-%Y}" if rs and re_ else "")
+                   if isinstance(s1.get("rows"), int) else f"{result_path.stat().st_size / 1024 / 1024:.2f} MB")
     else:
         st.button("Download Result", disabled=True, use_container_width=True, key="dl_disabled")
-        st.caption("🔒 Complete Step 2 first.")
+        st.caption("🔒 Complete Step 1 first.")
 
     # ------------------------------------------------------------ extras
     st.divider()
@@ -1495,7 +1294,7 @@ def main():
         "during a long step, reopen the same URL to continue."
     )
 
-    busy = any(get_status(job_dir, s)["state"] == "running" for s in (1, 2))
+    busy = get_status(job_dir, 1)["state"] == "running"
     st.fragment(run_every=POLL_SECONDS if busy else None)(render_workflow)(job_dir, job_id)
 
     st.caption("Your credentials are used only to start Step 1 and are never written to disk or logs.")
