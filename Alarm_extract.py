@@ -775,46 +775,112 @@ def wait_table_change(page, old_sig, timeout=30):
     return False
 
 
-# Finds the option (e.g. "500") inside the dropdown list that popped up next to the "Items" box.
-# Works with <li>, <div>, <span>, <mat-option>, role=option ... : any visible element whose text is exactly the size,
-# which is not inside the table and sits near the Items dropdown. The deepest matching element wins.
-MARK_OPTION_JS = r"""(size) => {
-  document.querySelectorAll('[data-pw-option]').forEach(e => e.removeAttribute('data-pw-option'));
-  const trig = document.querySelector('[data-pw-target="items"]');
-  if (!trig) return 'no-trigger';
-  const tr = trig.getBoundingClientRect();
-  const visible = el => {
+# ---------------------------------------------------------------------
+#  "Items" dropdown (10 / 50 / 100 / 250 / 500)
+#  Strategy: find the "Items" label under the Closed Alarm table, click the box to its RIGHT by
+#  screen coordinates (no element tagging: the page re-renders and removes tags), read the popup
+#  list by position, click the "500" entry by coordinates, and fall back to the keyboard.
+# ---------------------------------------------------------------------
+SIZE_ORDER = ["10", "50", "100", "250", "500"]
+
+ITEMS_LABEL_JS = "() => {" + _FIND_TABLE + r"""
+  const table = findTable();
+  if (!table) return null;
+  const vis = el => el.offsetParent !== null || el.getClientRects().length > 0;
+  const own = el => Array.from(el.childNodes).filter(n => n.nodeType === 3)
+                         .map(n => n.textContent).join(' ').replace(/[*:]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const labels = Array.from(document.querySelectorAll('body *')).filter(el =>
+      vis(el) && !table.contains(el) && (table.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)
+      && own(el) === 'items');
+  if (!labels.length) return null;
+  const el = labels[0];
+  el.scrollIntoView({block: 'center'});
+  const r = el.getBoundingClientRect();
+  const box = el.parentElement && el.parentElement.parentElement ? el.parentElement.parentElement : el.parentElement;
+  return {left: r.left, right: r.right, top: r.top, bottom: r.bottom,
+          html: box ? box.outerHTML.slice(0, 700) : ''};
+}"""
+
+FIND_OPTIONS_JS = r"""([ax, ay]) => {
+  const sizes = ['10', '50', '100', '250', '500'];
+  const found = [];
+  document.querySelectorAll('body *').forEach(el => {
+    if (el.closest('table')) return;
     const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return;
     const s = getComputedStyle(el);
-    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
-  };
-  const cands = Array.from(document.querySelectorAll('body *')).filter(el => {
-    if (el === trig || trig.contains(el) || el.closest('table')) return false;
-    if (!visible(el)) return false;
-    const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-    if (t !== size) return false;
-    const r = el.getBoundingClientRect();
-    return Math.abs(r.left - tr.left) < 250 && Math.abs((r.top + r.bottom) / 2 - (tr.top + tr.bottom) / 2) < 600;
+    if (s.visibility === 'hidden' || s.display === 'none') return;
+    const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+    if (!sizes.includes(t)) return;
+    if (Math.abs(r.left - ax) > 400 || Math.abs((r.top + r.bottom) / 2 - ay) > 700) return;
+    found.push({el, t, x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height});
   });
-  if (!cands.length) return 'no-option';
-  const deepest = cands.filter(el => !cands.some(o => o !== el && el.contains(o)));
-  const pick = deepest[0] || cands[0];
-  pick.setAttribute('data-pw-option', '1');
-  return 'ok';
+  const keep = found.filter(o => !found.some(p => p !== o && o.el.contains(p.el)));   // deepest only
+  return keep.map(o => ({t: o.t, x: o.x, y: o.y, w: o.w, h: o.h}));
 }"""
 
 
-def _click_page_size_option(page, size: str, timeout=8):
-    """Wait for the popup list and click the option whose text is exactly `size`."""
-    end = time.time() + timeout
-    res = ""
-    while time.time() < end:
-        res = page.evaluate(MARK_OPTION_JS, size)
-        if res == "ok":
-            safe_click(page.locator("[data-pw-option='1']").first)
-            return
+def get_items_anchor(page, job_dir: Path = None):
+    """Position of the 'Items' label (viewport coordinates), after scrolling it to the middle of the screen."""
+    page.evaluate(ITEMS_LABEL_JS)
+    page.wait_for_timeout(350)
+    anchor = page.evaluate(ITEMS_LABEL_JS)
+    if anchor and job_dir is not None and not getattr(get_items_anchor, "_logged", False):
+        get_items_anchor._logged = True
+        job_log(job_dir, f"Items label found at x={anchor['left']:.0f} y={anchor['top']:.0f}. "
+                         f"HTML around it: {anchor['html']}")
+    return anchor
+
+
+def open_items_dropdown(page, job_dir: Path):
+    """Click the box right of the 'Items' label until the option list (several sizes) is visible."""
+    anchor = None
+    for dx in (45, 30, 65, 85, 15):
+        anchor = get_items_anchor(page, job_dir)
+        if not anchor:
+            raise RuntimeError("Could not find the 'Items' label under the Closed Alarm table.")
+        cy = (anchor["top"] + anchor["bottom"]) / 2
+        page.mouse.click(anchor["right"] + dx, cy)
+        page.wait_for_timeout(800)
+        opts = page.evaluate(FIND_OPTIONS_JS, [anchor["left"], cy])
+        texts = sorted({o["t"] for o in opts}, key=lambda s: int(s))
+        job_log(job_dir, f"Clicked Items box at +{dx}px, visible size entries: {texts}")
+        if len(texts) >= 3:
+            return anchor, opts
+        try:
+            page.keyboard.press("Escape")
+        except PWError:
+            pass
         page.wait_for_timeout(300)
-    raise RuntimeError(f"option '{size}' not found in the Items dropdown (result: {res})")
+    return anchor, []
+
+
+def select_page_size(page, job_dir: Path, size: str) -> bool:
+    """Open the dropdown and choose `size`. Returns True when a click/keypress was made."""
+    try:
+        page.keyboard.press("Escape")
+    except PWError:
+        pass
+    anchor, opts = open_items_dropdown(page, job_dir)
+    take_shot(page, job_dir, f"shot_2a_dropdown_open_{size}")
+    cy = (anchor["top"] + anchor["bottom"]) / 2
+    # 1) click the entry by position
+    wanted = [o for o in opts if o["t"] == size]
+    if wanted:
+        o = sorted(wanted, key=lambda o: o["w"] * o["h"])[0]
+        job_log(job_dir, f"Clicking '{size}' at x={o['x']:.0f} y={o['y']:.0f}")
+        page.mouse.click(o["x"], o["y"])
+        return True
+    # 2) keyboard fallback (works for native selects and most custom listboxes)
+    idx = SIZE_ORDER.index(size)
+    job_log(job_dir, f"Entry '{size}' not visible; using the keyboard (ArrowDown x{idx} + Enter).", "WARNING")
+    page.mouse.click(anchor["right"] + 45, cy)       # make sure the box has focus / is open
+    page.wait_for_timeout(500)
+    for _ in range(idx):
+        page.keyboard.press("ArrowDown")
+        page.wait_for_timeout(120)
+    page.keyboard.press("Enter")
+    return True
 
 
 def pw_set_page_size(page, job_dir: Path):
@@ -826,19 +892,8 @@ def pw_set_page_size(page, job_dir: Path):
     old = table_sig(rows0)
     for size in PAGE_SIZE_CHOICES:
         try:
-            trigger = mark_control(page, "items", 20)
-            trigger.wait_for(state="visible", timeout=8000)
-            trigger.scroll_into_view_if_needed()
-            if trigger.evaluate("el => el.tagName") == "SELECT":
-                try:
-                    trigger.select_option(label=size)
-                except PWError:
-                    trigger.select_option(value=size)
-            else:
-                safe_click(trigger)                     # open the dropdown list (10 / 50 / 100 / 250 / 500)
-                page.wait_for_timeout(500)
-                _click_page_size_option(page, size)     # click the "500" entry
-            job_log(job_dir, f"Clicked '{size}' in the Items dropdown, waiting for the table to reload...")
+            select_page_size(page, job_dir, size)
+            job_log(job_dir, f"Selected '{size}' in the Items dropdown, waiting for the table to reload...")
             wait_table_change(page, old, PAGE_SIZE_LOAD_TIMEOUT)
             wait_loading_done(page)
             page.wait_for_timeout(800)
@@ -848,13 +903,13 @@ def pw_set_page_size(page, job_dir: Path):
                 return len(rows)
             job_log(job_dir, f"Page size {size} did not change the table ({len(rows)} rows).", "WARNING")
         except (PWError, RuntimeError) as exc:
-            job_log(job_dir, f"Page size {size} failed: {str(exc)[:150]}", "WARNING")
+            job_log(job_dir, f"Page size {size} failed: {str(exc)[:200]}", "WARNING")
         try:
             page.keyboard.press("Escape")
         except PWError:
             pass
-    job_log(job_dir, "Could not change the page size; continuing with the default (slower).", "WARNING")
-    return n0
+    raise RuntimeError("Could not set Items per page above 10 (see the shot_2a_dropdown_open_* screenshots "
+                       "and the log). Stopping instead of downloading 10 rows at a time.")
 
 
 # =====================================================================
