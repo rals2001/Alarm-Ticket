@@ -56,9 +56,10 @@ BLOCK_IMAGES = True
 
 SITE_UTC_OFFSET_HOURS = 7     # the site works in WIB (UTC+7)
 DATE_INPUT_FORMAT = "%d-%m-%Y"        # how the Start/End Date boxes display dates (02-10-2026)
-PAGE_SIZE_CHOICES = ("500", "100", "50")  # tried in this order in the "Items" dropdown
+PAGE_SIZE_CHOICES = ("500", "250", "100", "50")  # tried in this order in the "Items" dropdown (site offers 10/50/100/250/500)
 MAX_PAGES = 3000              # safety cap for the pagination loop
 DOWNLOAD_TIMEOUT = 240        # seconds to wait for ONE "By Page" file
+PAGE_SIZE_LOAD_TIMEOUT = 60   # seconds to wait for the table to reload after choosing a bigger page size
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 # =========================================================
@@ -774,8 +775,50 @@ def wait_table_change(page, old_sig, timeout=30):
     return False
 
 
+# Finds the option (e.g. "500") inside the dropdown list that popped up next to the "Items" box.
+# Works with <li>, <div>, <span>, <mat-option>, role=option ... : any visible element whose text is exactly the size,
+# which is not inside the table and sits near the Items dropdown. The deepest matching element wins.
+MARK_OPTION_JS = r"""(size) => {
+  document.querySelectorAll('[data-pw-option]').forEach(e => e.removeAttribute('data-pw-option'));
+  const trig = document.querySelector('[data-pw-target="items"]');
+  if (!trig) return 'no-trigger';
+  const tr = trig.getBoundingClientRect();
+  const visible = el => {
+    const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+  };
+  const cands = Array.from(document.querySelectorAll('body *')).filter(el => {
+    if (el === trig || trig.contains(el) || el.closest('table')) return false;
+    if (!visible(el)) return false;
+    const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+    if (t !== size) return false;
+    const r = el.getBoundingClientRect();
+    return Math.abs(r.left - tr.left) < 250 && Math.abs((r.top + r.bottom) / 2 - (tr.top + tr.bottom) / 2) < 600;
+  });
+  if (!cands.length) return 'no-option';
+  const deepest = cands.filter(el => !cands.some(o => o !== el && el.contains(o)));
+  const pick = deepest[0] || cands[0];
+  pick.setAttribute('data-pw-option', '1');
+  return 'ok';
+}"""
+
+
+def _click_page_size_option(page, size: str, timeout=8):
+    """Wait for the popup list and click the option whose text is exactly `size`."""
+    end = time.time() + timeout
+    res = ""
+    while time.time() < end:
+        res = page.evaluate(MARK_OPTION_JS, size)
+        if res == "ok":
+            safe_click(page.locator("[data-pw-option='1']").first)
+            return
+        page.wait_for_timeout(300)
+    raise RuntimeError(f"option '{size}' not found in the Items dropdown (result: {res})")
+
+
 def pw_set_page_size(page, job_dir: Path):
-    """Pick 100 (or 50 / 20) in the 'Items' dropdown. Returns the number of rows now shown."""
+    """Pick 500 (or 250 / 100 / 50 as fallback) in the 'Items' dropdown. Returns the number of rows now shown."""
     _, rows0 = read_table(page)
     n0 = len(rows0)
     if n0 and n0 < 10:
@@ -792,13 +835,13 @@ def pw_set_page_size(page, job_dir: Path):
                 except PWError:
                     trigger.select_option(value=size)
             else:
-                safe_click(trigger)
-                opt = first_visible(
-                    page,
-                    f"xpath=//*[(@role='option' or self::mat-option or self::li or self::option) "
-                    f"and normalize-space()='{size}']", 8)
-                safe_click(opt)
-            wait_table_change(page, old, 20)
+                safe_click(trigger)                     # open the dropdown list (10 / 50 / 100 / 250 / 500)
+                page.wait_for_timeout(500)
+                _click_page_size_option(page, size)     # click the "500" entry
+            job_log(job_dir, f"Clicked '{size}' in the Items dropdown, waiting for the table to reload...")
+            wait_table_change(page, old, PAGE_SIZE_LOAD_TIMEOUT)
+            wait_loading_done(page)
+            page.wait_for_timeout(800)
             _, rows = read_table(page)
             if len(rows) > n0:
                 job_log(job_dir, f"Page size set to {size}: {len(rows)} rows on the page now.")
@@ -909,7 +952,7 @@ def download_all_pages(page, job_dir: Path, pages_dir: Path, rep: StepReporter, 
         changed = False
         for attempt in (1, 2):
             safe_click(nxt)
-            if wait_table_change(page, old, 25):
+            if wait_table_change(page, old, 40):
                 changed = True
                 break
             job_log(job_dir, f"Page {page_no}: table did not change after clicking next (attempt {attempt}).", "WARNING")
@@ -1097,7 +1140,7 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
                 wait_loading_done(page)
                 page.wait_for_timeout(800)
 
-                rep.running("Setting items per page...", 0.33)
+                rep.running("Setting items per page to 500...", 0.33)
                 pw_set_page_size(page, job_dir)
                 take_shot(page, job_dir, "shot_2_after_page_size")
 
