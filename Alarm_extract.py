@@ -4,7 +4,8 @@ PMT Alarm – Closed Alarm downloader (Playwright edition)
 NEW FLOW (Step 1)
   1. Login
   2. Open the CLOSED ALARM tab
-  3. Find the "Items" dropdown and choose 500 instead of 10
+  3. Scroll to the bottom of the table (window + internal containers), find the "Items" dropdown
+     (native select / Vuetify / MUI / Angular Material / Ant / label / pagination-first) and choose 500 instead of 10
      (can take a while: the script WAITS until the table really shows the bigger page, not 10 rows)
   4. Type Start Date / End Date and click Apply
      (if the site resets the page size after Apply, 500 is selected again and verified)
@@ -575,8 +576,8 @@ def pw_click_closed_alarm_tab(page, job_dir: Path):
     if not headers:
         raise RuntimeError("The CLOSED ALARM table did not appear after clicking the tab.")
     job_log(job_dir, f"Closed Alarm table detected, columns: {headers}")
-    wait_loading_done(page)
-    page.wait_for_timeout(800)
+    wait_loading_done(page, 20000)
+    page.wait_for_timeout(4000)   # the pagination footer may render later than the table
 
 
 # =====================================================================
@@ -799,29 +800,301 @@ def wait_table_change(page, old_sig, timeout=30):
 
 
 # ---------------------------------------------------------------------
-#  "Items" dropdown (10 / 50 / 100 / 250 / 500)
-#  Strategy: find the "Items" label under the Closed Alarm table, click the box to its RIGHT by
-#  screen coordinates (no element tagging: the page re-renders and removes tags), read the popup
-#  list by position, click the "500" entry by coordinates, and fall back to the keyboard.
+#  "Items" dropdown (10 / 50 / 100 / 250 / 500) -- FOOTER DISCOVERY EDITION
+#
+#  Why the old version failed on Streamlit Cloud ("Could not find the 'Items' label"):
+#   - the footer can be below the fold or inside an INTERNAL scroll container,
+#   - it can render later than the table,
+#   - it can live inside <tfoot> (the old code ignored everything inside the table),
+#   - the label text may differ ("Items per page", "Rows per page", "Tampilkan", ...),
+#   - the site may use Vuetify / MUI / Angular Material / Ant widgets (or a virtualized table).
+#  So now: scroll every scrollable ancestor + the window to the bottom, screenshot, dump the footer DOM,
+#  enumerate controls, then try several locator strategies (every attempt is logged).
+#  The step only fails AFTER all of that has been done.
 # ---------------------------------------------------------------------
 SIZE_ORDER = ["10", "50", "100", "250", "500"]
+SITE_INFO = {"framework": "generic", "virtualized": False}
 
-ITEMS_LABEL_JS = "() => {" + _FIND_TABLE + r"""
+SELECT_LIKE_CSS = (
+    "select, [role='combobox'], [role='listbox'], [aria-haspopup='listbox'], mat-select, "
+    ".v-select, .v-field, .MuiSelect-select, .MuiTablePagination-select, .ant-select, .q-select, "
+    "[class*='select' i], [class*='dropdown' i], [class*='combo' i]"
+)
+
+FRAMEWORK_SELECTORS = {
+    "vuetify_app": ".v-application, .v-app",
+    "vuetify_table": ".v-data-table",
+    "vuetify2_footer": ".v-data-footer",
+    "vuetify3_footer": ".v-data-table-footer",
+    "vuetify_select": ".v-select",
+    "vuetify_virtual": ".v-data-table-virtual, .v-virtual-scroll",
+    "mui_table": ".MuiTable-root",
+    "mui_pagination": ".MuiTablePagination-root",
+    "mui_datagrid": ".MuiDataGrid-root",
+    "mui_virtual": ".MuiDataGrid-virtualScroller",
+    "mat_paginator": "mat-paginator, .mat-mdc-paginator",
+    "ant_table": ".ant-table",
+    "ant_pagination": ".ant-pagination",
+    "quasar": ".q-table",
+    "ag_grid": ".ag-root",
+    "virtual_strict": ".vue-recycle-scroller, .vue-virtual-scroller, [class*='virtual-scroll' i], "
+                      "[class*='react-window' i], [class*='virtuoso' i]",
+    "virtual_loose": "[class*='virtual' i]",
+    "plain_table": "table",
+    "tfoot": "tfoot",
+}
+
+# (name, css) -> tried in this order with Playwright locators. Framework-specific first, then generic.
+ITEMS_SELECTORS = [
+    ("vuetify3 items-per-page", ".v-data-table-footer__items-per-page .v-select, "
+                                ".v-data-table-footer__items-per-page .v-field"),
+    ("vuetify2 footer select", ".v-data-footer__select .v-select"),
+    ("mui table pagination", ".MuiTablePagination-select, .MuiTablePagination-root [role='combobox']"),
+    ("angular-material paginator", "mat-paginator mat-select, .mat-mdc-paginator-page-size-select mat-select, "
+                                   ".mat-paginator-page-size-select mat-select"),
+    ("antd pagination options", ".ant-pagination-options .ant-select"),
+    ("quasar table bottom", ".q-table__bottom .q-select"),
+    ("aria-label per page", "[aria-label*='per page' i], [aria-label*='items' i][role='combobox'], "
+                            "[aria-label*='rows' i][role='combobox']"),
+]
+
+FRAMEWORK_JS = """(sels) => {
+  const out = {};
+  for (const [k, s] of Object.entries(sels)) {
+    try { out[k] = document.querySelectorAll(s).length; } catch (e) { out[k] = 'err'; }
+  }
+  return out;
+}"""
+
+SCROLL_FOOTER_JS = "() => {" + _FIND_TABLE + r"""
+  const out = {containers: [], win: null, noTable: false};
   const table = findTable();
-  if (!table) return null;
-  const vis = el => el.offsetParent !== null || el.getClientRects().length > 0;
+  const scrollable = e => {
+    const s = getComputedStyle(e);
+    return /(auto|scroll|overlay)/.test(s.overflowY) && e.scrollHeight > e.clientHeight + 2;
+  };
+  const describe = e => e.tagName.toLowerCase() + (e.id ? '#' + e.id : '') +
+      ((e.className && e.className.toString && e.className.toString().trim())
+        ? '.' + e.className.toString().trim().split(/\s+/).slice(0, 3).join('.') : '');
+  if (table) {
+    const rows = table.querySelectorAll('tbody tr');
+    if (rows.length) rows[rows.length - 1].scrollIntoView({block: 'end', behavior: 'instant'});
+    let p = table.parentElement;
+    while (p && p !== document.body && p !== document.documentElement) {
+      if (scrollable(p)) {
+        const before = Math.round(p.scrollTop);
+        p.scrollTop = p.scrollHeight;
+        out.containers.push({el: describe(p), before: before, after: Math.round(p.scrollTop),
+                             scrollH: p.scrollHeight, clientH: p.clientHeight});
+      }
+      p = p.parentElement;
+    }
+  } else {
+    out.noTable = true;
+  }
+  const se = document.scrollingElement || document.documentElement;
+  const b = Math.round(se.scrollTop);
+  se.scrollTop = se.scrollHeight;
+  window.scrollTo(0, document.body.scrollHeight);
+  out.win = {before: b, after: Math.round(se.scrollTop), scrollH: se.scrollHeight, innerH: window.innerHeight};
+  return out;
+}"""
+
+FOOTER_DUMP_JS = "() => {" + _FIND_TABLE + r"""
+  const table = findTable();
+  if (!table) return {error: 'no Closed Alarm table found'};
+  const cls = e => (e.className && e.className.toString) ? e.className.toString().trim() : '';
+  const out = {chain: [], tfoot: table.tFoot ? table.tFoot.outerHTML.slice(0, 6000) : '', following: []};
+  let child = table, parent = table.parentElement, level = 0;
+  while (parent && level < 7) {
+    out.chain.push(level + ': ' + parent.tagName.toLowerCase() + (parent.id ? '#' + parent.id : '') + ' .' + cls(parent).slice(0, 120));
+    let sib = child.nextElementSibling;
+    while (sib) {
+      out.following.push({level: level, tag: sib.tagName.toLowerCase(), cls: cls(sib).slice(0, 120),
+                          html: sib.outerHTML.slice(0, 4000)});
+      sib = sib.nextElementSibling;
+    }
+    child = parent; parent = parent.parentElement; level++;
+  }
+  return out;
+}"""
+
+ENUM_JS = "([css]) => {" + _FIND_TABLE + r"""
+  const table = findTable();
+  const vis = el => (el.offsetParent !== null || el.getClientRects().length > 0) && el.getBoundingClientRect().width > 0;
+  const tr = table ? table.getBoundingClientRect() : null;
+  const tableBottom = tr ? tr.bottom + window.scrollY : 0;
+  const base = css + ", button, [role='button'], a[role='button'], input, textarea";
+  const out = [];
+  document.querySelectorAll(base).forEach(el => {
+    if (!vis(el)) return;
+    const r = el.getBoundingClientRect();
+    const absTop = r.top + window.scrollY;
+    const inTfoot = !!el.closest('tfoot');
+    const inBody = table && table.contains(el) && !inTfoot;
+    const afterTable = table ? ((table.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) && !table.contains(el)) : true;
+    if (inBody) return;
+    if (!(inTfoot || afterTable || absTop >= tableBottom - 150)) return;
+    out.push({
+      tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '', type: el.getAttribute('type') || '',
+      cls: ((el.className && el.className.toString) ? el.className.toString() : '').slice(0, 70),
+      text: (el.innerText || el.value || '').replace(/\s+/g, ' ').trim().slice(0, 40),
+      aria: el.getAttribute('aria-label') || '', title: el.getAttribute('title') || '',
+      selectLike: el.matches(css), x: Math.round(r.left), y: Math.round(r.top),
+      w: Math.round(r.width), h: Math.round(r.height), absTop: Math.round(absTop),
+      cx: r.left + r.width / 2, cy: r.top + r.height / 2, left: r.left, top: r.top
+    });
+  });
+  return out.slice(0, 90);
+}"""
+
+PAGINATION_JS = "([css]) => {" + _FIND_TABLE + r"""
+  const table = findTable();
+  const vis = el => (el.offsetParent !== null || el.getClientRects().length > 0) && el.getBoundingClientRect().width > 0;
+  const cls = e => (e.className && e.className.toString) ? e.className.toString().trim() : '';
+  const tableTop = table ? table.getBoundingClientRect().top + window.scrollY : 0;
+  const below = el => (el.getBoundingClientRect().top + window.scrollY) >= tableTop - 5 && !(table && table.contains(el) && !el.closest('tfoot'));
+  const named = Array.from(document.querySelectorAll(
+    "nav, [role='navigation'], [class*='pagination' i], [class*='paginator' i], .v-pagination, .MuiPagination-root, " +
+    ".MuiTablePagination-root, mat-paginator, .mat-mdc-paginator, .ant-pagination, .v-data-footer, " +
+    ".v-data-table-footer, .q-table__bottom, tfoot")).filter(el => vis(el) && below(el));
+  const isDigit = el => /^\d{1,5}$/.test((el.innerText || '').trim());
+  const digits = Array.from(document.querySelectorAll('button, a, li, [role="button"]'))
+      .filter(el => vis(el) && below(el) && isDigit(el));
+  const common = list => {
+    let a = list[0].parentElement;
+    while (a && !list.every(x => a.contains(x))) a = a.parentElement;
+    return a;
+  };
+  let root = null, how = '';
+  if (named.length) { root = named[named.length - 1]; how = 'named container'; }
+  else if (digits.length >= 2) { root = common(digits); how = 'common parent of ' + digits.length + ' page-number buttons'; }
+  else if (digits.length === 1) { root = digits[0].parentElement; how = 'parent of the only page-number button'; }
+  if (!root) return {root: null, digits: digits.length, named: named.length};
+  root.scrollIntoView({block: 'center', behavior: 'instant'});
+  const chain = [];
+  let n = root;
+  for (let i = 0; i < 6 && n && n !== document.body; i++) {
+    chain.push(i + ': ' + n.tagName.toLowerCase() + (n.id ? '#' + n.id : '') + ' .' + cls(n).slice(0, 100));
+    n = n.parentElement;
+  }
+  // look for a select-like control in the pagination root and then in its ancestors
+  let control = null, level = -1;
+  n = root;
+  for (let i = 0; i < 6 && n && !control; i++) {
+    const cands = Array.from(n.querySelectorAll(css)).filter(c => {
+      if (!vis(c)) return false;
+      const r = c.getBoundingClientRect();
+      if (r.width < 30 || r.height < 16) return false;
+      if (isDigit(c) && c.tagName !== 'SELECT') return false;
+      return true;
+    });
+    cands.sort((a, b) => {
+      const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+      return ra.width * ra.height - rb.width * rb.height;
+    });
+    if (cands.length) { control = cands[0]; level = i; }
+    n = n.parentElement;
+  }
+  const rr = root.getBoundingClientRect();
+  const res = {root: {tag: root.tagName.toLowerCase(), cls: cls(root).slice(0, 150), how: how,
+                      html: root.outerHTML.slice(0, 2500), left: rr.left, top: rr.top, w: rr.width, h: rr.height},
+               chain: chain, digits: digits.length, named: named.length, control: null, level: level};
+  if (control) {
+    const r = control.getBoundingClientRect();
+    res.control = {tag: control.tagName.toLowerCase(), cls: cls(control).slice(0, 120),
+                   left: r.left, top: r.top, w: r.width, h: r.height, text: (control.innerText || '').slice(0, 30)};
+  }
+  return res;
+}"""
+
+LABEL_JS = "([css]) => {" + _FIND_TABLE + r"""
+  const table = findTable();
+  const tableTop = table ? table.getBoundingClientRect().top + window.scrollY : 0;
+  const vis = el => (el.offsetParent !== null || el.getClientRects().length > 0) && el.getBoundingClientRect().width > 0;
   const own = el => Array.from(el.childNodes).filter(n => n.nodeType === 3)
                          .map(n => n.textContent).join(' ').replace(/[*:]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
-  const labels = Array.from(document.querySelectorAll('body *')).filter(el =>
-      vis(el) && !table.contains(el) && (table.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)
-      && own(el) === 'items');
+  const re = /^(items|items per page|item per page|rows per page|per page|show items|show rows|tampilkan|baris per halaman|item per halaman|jumlah baris|jumlah data)$/;
+  let labels = Array.from(document.querySelectorAll('body *')).filter(el => vis(el) && re.test(own(el)));
+  labels = labels.filter(el => (el.getBoundingClientRect().top + window.scrollY) >= tableTop - 5);
   if (!labels.length) return null;
-  const el = labels[0];
-  el.scrollIntoView({block: 'center'});
-  const r = el.getBoundingClientRect();
-  const box = el.parentElement && el.parentElement.parentElement ? el.parentElement.parentElement : el.parentElement;
-  return {left: r.left, right: r.right, top: r.top, bottom: r.bottom,
-          html: box ? box.outerHTML.slice(0, 700) : ''};
+  const label = labels[labels.length - 1];
+  label.scrollIntoView({block: 'center', behavior: 'instant'});
+  const lr = label.getBoundingClientRect();
+  const lcy = (lr.top + lr.bottom) / 2;
+  const cls = e => (e.className && e.className.toString) ? e.className.toString().trim() : '';
+  let control = null, node = label, level = -1;
+  for (let i = 0; i < 5 && !control; i++) {
+    node = node.parentElement;
+    if (!node) break;
+    const cands = Array.from(node.querySelectorAll(css)).filter(c => {
+      if (!vis(c) || c.contains(label) || label.contains(c)) return false;
+      const r = c.getBoundingClientRect();
+      const cy = (r.top + r.bottom) / 2;
+      return r.width >= 30 && r.height >= 16 && r.right > lr.left && Math.abs(cy - lcy) < 45;
+    });
+    cands.sort((a, b) => {
+      const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+      return ra.width * ra.height - rb.width * rb.height;
+    });
+    if (cands.length) { control = cands[0]; level = i; }
+  }
+  const res = {label: {text: own(label), tag: label.tagName.toLowerCase(), cls: cls(label).slice(0, 100),
+                       left: lr.left, right: lr.right, top: lr.top, bottom: lr.bottom},
+               control: null, level: level,
+               html: (label.parentElement && label.parentElement.parentElement
+                      ? label.parentElement.parentElement : label.parentElement || label).outerHTML.slice(0, 1500)};
+  if (control) {
+    const r = control.getBoundingClientRect();
+    res.control = {tag: control.tagName.toLowerCase(), cls: cls(control).slice(0, 120),
+                   left: r.left, top: r.top, w: r.width, h: r.height};
+  }
+  return res;
+}"""
+
+NATIVE_SELECT_JS = r"""() => {
+  document.querySelectorAll('[data-pw-items]').forEach(e => e.removeAttribute('data-pw-items'));
+  const sizes = ['10', '50', '100', '250', '500'];
+  const all = Array.from(document.querySelectorAll('select'));
+  const info = {total: all.length, matches: []};
+  all.forEach((s, i) => {
+    const vals = Array.from(s.options).map(o => (o.value || o.text || '').trim());
+    const hit = sizes.filter(z => vals.includes(z) || Array.from(s.options).some(o => (o.text || '').trim() === z));
+    if (hit.length >= 2) info.matches.push({i: i, vals: vals.slice(0, 12), value: s.value});
+  });
+  if (info.matches.length) {
+    all[info.matches[info.matches.length - 1].i].setAttribute('data-pw-items', '1');
+    all[info.matches[info.matches.length - 1].i].scrollIntoView({block: 'center', behavior: 'instant'});
+  }
+  return info;
+}"""
+
+TEXT_HITS_JS = "() => {" + _FIND_TABLE + r"""
+  const table = findTable();
+  const re = /items|per page|rows|tampilkan|halaman|show/i;
+  const own = el => Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join(' ').replace(/\s+/g, ' ').trim();
+  const out = [];
+  document.querySelectorAll('body *').forEach(el => {
+    const t = own(el);
+    if (!t || t.length > 40 || !re.test(t)) return;
+    const r = el.getBoundingClientRect();
+    out.push({tag: el.tagName.toLowerCase(), text: t, inTable: !!(table && table.contains(el)),
+              inTfoot: !!el.closest('tfoot'),
+              visible: (el.offsetParent !== null || el.getClientRects().length > 0) && r.width > 0,
+              absTop: Math.round(r.top + window.scrollY), absLeft: Math.round(r.left)});
+  });
+  return {hits: out.slice(0, 30), docH: document.documentElement.scrollHeight, bodyTail: (document.body.innerText || '').slice(-500)};
+}"""
+
+PAGE_RANGE_JS = r"""() => {
+  const els = document.querySelectorAll("tfoot, [class*='pagination' i], [class*='footer' i], mat-paginator, " +
+                                        ".MuiTablePagination-root, .q-table__bottom, .ant-pagination");
+  for (const el of els) {
+    const t = (el.innerText || '');
+    const m = t.match(/(\d[\d.,]*)\s*[-\u2013\u2014]\s*(\d[\d.,]*)\s*(?:of|dari|\/)\s*(\d[\d.,]*)/i);
+    if (m) return [m[1], m[2], m[3]];
+  }
+  return null;
 }"""
 
 FIND_OPTIONS_JS = r"""([ax, ay]) => {
@@ -835,7 +1108,7 @@ FIND_OPTIONS_JS = r"""([ax, ay]) => {
     if (s.visibility === 'hidden' || s.display === 'none') return;
     const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
     if (!sizes.includes(t)) return;
-    if (Math.abs(r.left - ax) > 400 || Math.abs((r.top + r.bottom) / 2 - ay) > 700) return;
+    if (Math.abs(r.left - ax) > 500 || Math.abs((r.top + r.bottom) / 2 - ay) > 800) return;
     found.push({el, t, x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height});
   });
   const keep = found.filter(o => !found.some(p => p !== o && o.el.contains(p.el)));   // deepest only
@@ -843,50 +1116,361 @@ FIND_OPTIONS_JS = r"""([ax, ay]) => {
 }"""
 
 
-def get_items_anchor(page, job_dir: Path = None):
-    """Position of the 'Items' label (viewport coordinates), after scrolling it to the middle of the screen."""
-    page.evaluate(ITEMS_LABEL_JS)
-    page.wait_for_timeout(350)
-    anchor = page.evaluate(ITEMS_LABEL_JS)
-    if anchor and job_dir is not None and not getattr(get_items_anchor, "_logged", False):
-        get_items_anchor._logged = True
-        job_log(job_dir, f"Items label found at x={anchor['left']:.0f} y={anchor['top']:.0f}. "
-                         f"HTML around it: {anchor['html']}")
-    return anchor
+def _num(x) -> int:
+    return int(re.sub(r"\D", "", str(x)) or 0)
 
 
-def open_items_dropdown(page, job_dir: Path):
-    """Click the box right of the 'Items' label until the option list (several sizes) is visible."""
-    anchor = None
-    for dx in (45, 30, 65, 85, 15):
-        anchor = get_items_anchor(page, job_dir)
-        if not anchor:
-            raise RuntimeError("Could not find the 'Items' label under the Closed Alarm table.")
-        cy = (anchor["top"] + anchor["bottom"]) / 2
-        page.mouse.click(anchor["right"] + dx, cy)
-        page.wait_for_timeout(800)
-        opts = page.evaluate(FIND_OPTIONS_JS, [anchor["left"], cy])
+def detect_site(page, job_dir: Path, verbose=True) -> dict:
+    """Detect Vuetify / MUI / Angular Material / Ant / Quasar / AG Grid and whether the table is virtualized."""
+    try:
+        counts = page.evaluate(FRAMEWORK_JS, FRAMEWORK_SELECTORS)
+    except PWError as exc:
+        job_log(job_dir, f"SITE detection failed: {str(exc)[:150]}", "WARNING")
+        return {}
+    z = lambda k: isinstance(counts.get(k), int) and counts[k] > 0
+    if z("vuetify_app") or z("vuetify_table") or z("vuetify2_footer") or z("vuetify3_footer") or z("vuetify_select"):
+        fw = "vuetify"
+    elif z("mui_table") or z("mui_pagination") or z("mui_datagrid"):
+        fw = "mui"
+    elif z("mat_paginator"):
+        fw = "angular-material"
+    elif z("ant_table") or z("ant_pagination"):
+        fw = "antd"
+    elif z("quasar"):
+        fw = "quasar"
+    elif z("ag_grid"):
+        fw = "ag-grid"
+    else:
+        fw = "generic"
+    virt = z("vuetify_virtual") or z("mui_virtual") or z("ag_grid") or z("virtual_strict")
+    SITE_INFO["framework"], SITE_INFO["virtualized"] = fw, virt
+    if verbose:
+        nonzero = {k: v for k, v in counts.items() if v}
+        job_log(job_dir, f"SITE: framework={fw} virtualized_table={virt} "
+                         f"(loose 'virtual' class matches={counts.get('virtual_loose')}) counts={nonzero}")
+        if virt:
+            job_log(job_dir, "SITE: virtualized table detected -> DOM row counts can under-report; "
+                             "the footer range text ('1-500 of N') is used as an extra signal.", "WARNING")
+    return counts
+
+
+def read_range(page):
+    try:
+        r = page.evaluate(PAGE_RANGE_JS)
+    except PWError:
+        return None
+    if not r:
+        return None
+    a, b, t = (_num(x) for x in r)
+    return (a, b, t) if b >= a > 0 else None
+
+
+def effective_rows(page) -> int:
+    """Rows on the page. For virtualized tables the DOM only holds the visible window, so use the footer range."""
+    n = count_rows(page)
+    if SITE_INFO.get("virtualized"):
+        r = read_range(page)
+        if r:
+            n = max(n, r[1] - r[0] + 1)
+    return n
+
+
+def scroll_to_footer(page, job_dir: Path, label="", verbose=True, passes=3):
+    """Scroll every scrollable ancestor of the table AND the window to the very bottom."""
+    last = None
+    for _ in range(passes):
+        try:
+            last = page.evaluate(SCROLL_FOOTER_JS)
+        except PWError as exc:
+            job_log(job_dir, f"[scroll {label}] JS scroll failed: {str(exc)[:150]}", "WARNING")
+        page.wait_for_timeout(500)
+    try:
+        page.mouse.move(800, 600)
+        page.mouse.wheel(0, 4000)
+    except PWError:
+        pass
+    page.wait_for_timeout(700)
+    if verbose and last:
+        conts = "; ".join(f"{c['el']} scrollTop {c['before']}->{c['after']} (scrollH={c['scrollH']}, clientH={c['clientH']})"
+                          for c in last.get("containers", [])) or "none"
+        w = last.get("win") or {}
+        job_log(job_dir, f"SCROLL [{label}] table_found={not last.get('noTable')} "
+                         f"scrollable containers: {conts} | window scrollTop {w.get('before')}->{w.get('after')} "
+                         f"(scrollH={w.get('scrollH')}, innerH={w.get('innerH')})")
+    return last
+
+
+def append_dom(job_dir: Path, tag: str, text: str):
+    try:
+        with open(job_dir / f"dom_{tag}diag.txt", "a", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    except OSError:
+        pass
+
+
+def diagnose_footer(page, job_dir: Path, tag: str, title: str):
+    """Dump footer HTML, enumerate controls near the bottom, find pagination root, list 'items'-like texts."""
+    job_log(job_dir, f"--- DOM INSPECTION ({title}) ---")
+    append_dom(job_dir, tag, f"\n===== {title} @ {datetime.now():%H:%M:%S} =====")
+    detect_site(page, job_dir)
+
+    # 4) footer HTML
+    try:
+        dump = page.evaluate(FOOTER_DUMP_JS)
+        if dump.get("error"):
+            job_log(job_dir, f"FOOTER DUMP: {dump['error']}", "WARNING")
+            append_dom(job_dir, tag, f"FOOTER DUMP: {dump['error']}")
+        else:
+            job_log(job_dir, "FOOTER ancestors: " + " | ".join(dump["chain"]))
+            job_log(job_dir, f"FOOTER <tfoot> html: {dump['tfoot'][:600] or '(none)'}")
+            append_dom(job_dir, tag, "ANCESTORS:\n" + "\n".join(dump["chain"]))
+            append_dom(job_dir, tag, "TFOOT:\n" + (dump["tfoot"] or "(none)"))
+            if not dump["following"]:
+                job_log(job_dir, "FOOTER: the table has NO following siblings at any of the 7 ancestor levels.",
+                        "WARNING")
+            for item in dump["following"]:
+                job_log(job_dir, f"FOOTER sibling (level {item['level']}) <{item['tag']} class='{item['cls']}'> "
+                                 f"{item['html'][:500]}")
+                append_dom(job_dir, tag, f"SIBLING level {item['level']} <{item['tag']} class='{item['cls']}'>\n{item['html']}")
+    except PWError as exc:
+        job_log(job_dir, f"FOOTER DUMP failed: {str(exc)[:150]}", "WARNING")
+
+    # 5) every select / combobox / button / dropdown near the bottom
+    try:
+        els = page.evaluate(ENUM_JS, [SELECT_LIKE_CSS])
+        job_log(job_dir, f"ENUM: {len(els)} visible select/combobox/button/dropdown/input elements near the bottom")
+        for e in els:
+            line = (f"  <{e['tag']}{'[' + e['type'] + ']' if e['type'] else ''}> role={e['role'] or '-'} "
+                    f"selectLike={e['selectLike']} text='{e['text']}' aria='{e['aria']}' class='{e['cls']}' "
+                    f"at x={e['x']} y={e['y']} {e['w']}x{e['h']} absTop={e['absTop']}")
+            job_log(job_dir, line)
+            append_dom(job_dir, tag, "ENUM" + line)
+    except PWError as exc:
+        job_log(job_dir, f"ENUM failed: {str(exc)[:150]}", "WARNING")
+
+    # 7) pagination controls and their parent container
+    try:
+        pag = page.evaluate(PAGINATION_JS, [SELECT_LIKE_CSS])
+        if not pag.get("root"):
+            job_log(job_dir, f"PAGINATION: no pagination container found (page-number buttons={pag.get('digits')}, "
+                             f"named containers={pag.get('named')}).", "WARNING")
+        else:
+            r = pag["root"]
+            job_log(job_dir, f"PAGINATION: root=<{r['tag']} class='{r['cls']}'> via {r['how']}; "
+                             f"{pag['digits']} page-number buttons; chain: {' | '.join(pag['chain'])}")
+            job_log(job_dir, f"PAGINATION root html: {r['html'][:700]}")
+            append_dom(job_dir, tag, "PAGINATION ROOT:\n" + r["html"] + "\nCHAIN:\n" + "\n".join(pag["chain"]))
+            if pag.get("control"):
+                job_log(job_dir, f"PAGINATION: select-like control found {pag['control']} at ancestor level {pag['level']}")
+    except PWError as exc:
+        job_log(job_dir, f"PAGINATION probe failed: {str(exc)[:150]}", "WARNING")
+
+    # where does text like "Items" / "per page" / "Rows" exist at all?
+    try:
+        th = page.evaluate(TEXT_HITS_JS)
+        job_log(job_dir, f"TEXT HITS ('items'/'per page'/'rows'/...): {len(th['hits'])}, document height={th['docH']}")
+        for h in th["hits"]:
+            job_log(job_dir, f"  '{h['text']}' <{h['tag']}> inTable={h['inTable']} inTfoot={h['inTfoot']} "
+                             f"visible={h['visible']} absTop={h['absTop']} absLeft={h['absLeft']}")
+        job_log(job_dir, f"BODY TAIL (last 500 chars of page text): {th['bodyTail']!r}")
+        append_dom(job_dir, tag, "TEXT HITS: " + json.dumps(th["hits"]) + "\nBODY TAIL: " + th["bodyTail"])
+    except PWError as exc:
+        job_log(job_dir, f"TEXT HITS failed: {str(exc)[:150]}", "WARNING")
+
+
+def _point(how, left, top, w, h):
+    return {"kind": "point", "how": how, "left": left, "right": left + w, "top": top, "bottom": top + h,
+            "w": w, "h": h, "cx": left + w / 2, "cy": top + h / 2}
+
+
+def locate_control_once(page, job_dir: Path):
+    """
+    Try every strategy once and log each attempt. Returns
+      {'kind': 'native', ...}  for a real <select> that contains the sizes, or
+      {'kind': 'point', cx, cy, ...} for a custom dropdown (click by coordinates), or None.
+    """
+    # strategy 0: native <select> with 10/50/100/250/500 options
+    try:
+        info = page.evaluate(NATIVE_SELECT_JS)
+        if info["matches"]:
+            m = info["matches"][-1]
+            job_log(job_dir, f"LOCATE [native <select>] -> FOUND options={m['vals']} current='{m['value']}' "
+                             f"({info['total']} selects on page)")
+            return {"kind": "native", "how": "native select"}
+        job_log(job_dir, f"LOCATE [native <select>] -> none ({info['total']} <select> elements, none with page sizes)")
+    except PWError as exc:
+        job_log(job_dir, f"LOCATE [native <select>] -> error {str(exc)[:120]}", "WARNING")
+
+    # strategy 1: framework-specific selectors (Vuetify / MUI / Angular Material / Ant / Quasar / aria-label)
+    for name, css in ITEMS_SELECTORS:
+        try:
+            loc = page.locator(css)
+            n = loc.count()
+            vis = [i for i in range(min(n, 8)) if loc.nth(i).is_visible()]
+            job_log(job_dir, f"LOCATE [{name}] css='{css[:80]}' -> {n} match(es), {len(vis)} visible")
+            if vis:
+                el = loc.nth(vis[-1])
+                el.scroll_into_view_if_needed(timeout=3000)
+                box = el.bounding_box()
+                if box:
+                    job_log(job_dir, f"LOCATE [{name}] -> USING it at x={box['x']:.0f} y={box['y']:.0f} "
+                                     f"{box['width']:.0f}x{box['height']:.0f}")
+                    return _point(name, box["x"], box["y"], box["width"], box["height"])
+        except PWError as exc:
+            job_log(job_dir, f"LOCATE [{name}] -> error {str(exc)[:120]}", "WARNING")
+
+    # strategy 2: a text label ("Items", "Items per page", "Rows per page", "Tampilkan", ...) incl. inside <tfoot>
+    try:
+        res = page.evaluate(LABEL_JS, [SELECT_LIKE_CSS])
+        if not res:
+            job_log(job_dir, "LOCATE [text label] -> no 'Items'/'per page'/'Rows per page'/'Tampilkan' label below the table")
+        else:
+            lab = res["label"]
+            job_log(job_dir, f"LOCATE [text label] -> label '{lab['text']}' <{lab['tag']} class='{lab['cls']}'> "
+                             f"at x={lab['left']:.0f} y={lab['top']:.0f}; html: {res['html'][:500]}")
+            if res.get("control"):
+                c = res["control"]
+                job_log(job_dir, f"LOCATE [text label] -> USING select-like <{c['tag']} class='{c['cls']}'> "
+                                 f"(found {res['level']} level(s) above the label)")
+                return _point("label+control", c["left"], c["top"], c["w"], c["h"])
+            job_log(job_dir, "LOCATE [text label] -> no select-like element next to the label; "
+                             "will click to the right of the label", "WARNING")
+            h = max(20.0, lab["bottom"] - lab["top"])
+            return _point("label-offset", lab["right"] + 10, lab["top"], 70, h)
+    except PWError as exc:
+        job_log(job_dir, f"LOCATE [text label] -> error {str(exc)[:120]}", "WARNING")
+
+    # strategy 3: pagination controls first, then the select-like control inside / around their container
+    try:
+        pag = page.evaluate(PAGINATION_JS, [SELECT_LIKE_CSS])
+        if not pag.get("root"):
+            job_log(job_dir, f"LOCATE [pagination-first] -> no pagination container "
+                             f"(page-number buttons={pag.get('digits')}, named containers={pag.get('named')})")
+        else:
+            job_log(job_dir, f"LOCATE [pagination-first] -> pagination root <{pag['root']['tag']} "
+                             f"class='{pag['root']['cls']}'> via {pag['root']['how']}")
+            if pag.get("control"):
+                c = pag["control"]
+                job_log(job_dir, f"LOCATE [pagination-first] -> USING select-like <{c['tag']} class='{c['cls']}'> "
+                                 f"text='{c['text']}' (ancestor level {pag['level']})")
+                return _point("pagination+control", c["left"], c["top"], c["w"], c["h"])
+            job_log(job_dir, "LOCATE [pagination-first] -> no select-like control inside the pagination container "
+                             "or its 5 ancestors", "WARNING")
+    except PWError as exc:
+        job_log(job_dir, f"LOCATE [pagination-first] -> error {str(exc)[:120]}", "WARNING")
+
+    # strategy 4: any select-like element near the bottom that currently DISPLAYS a page size (10/50/100/...)
+    try:
+        els = page.evaluate(ENUM_JS, [SELECT_LIKE_CSS])
+        hits = [e for e in els if e["selectLike"] and e["w"] >= 30 and e["h"] >= 16
+                and re.fullmatch(r"(10|50|100|250|500)", re.sub(r"\D", "", e["text"]) or "x") and len(e["text"]) <= 12]
+        job_log(job_dir, f"LOCATE [shows-a-page-size] -> {len(els)} candidates near the bottom, {len(hits)} look like "
+                         f"a size selector")
+        if hits:
+            e = hits[-1]
+            job_log(job_dir, f"LOCATE [shows-a-page-size] -> USING <{e['tag']} class='{e['cls']}'> text='{e['text']}'")
+            return _point("shows-a-page-size", e["left"], e["top"], e["w"], e["h"])
+    except PWError as exc:
+        job_log(job_dir, f"LOCATE [shows-a-page-size] -> error {str(exc)[:120]}", "WARNING")
+    return None
+
+
+def find_items_control(page, job_dir: Path, tag="", rounds=4):
+    """
+    Scroll to the footer, take screenshots before/after, inspect the DOM, locate the Items control.
+    Retries a few rounds (the footer may render later than the table). Only returns None after the
+    scrolling and the full DOM inspection have been done.
+    """
+    take_shot(page, job_dir, f"shot_{tag}before_scroll")
+    for rnd in range(1, rounds + 1):
+        scroll_to_footer(page, job_dir, f"{tag}round{rnd}")
+        if rnd == 1:
+            take_shot(page, job_dir, f"shot_{tag}after_scroll")
+            diagnose_footer(page, job_dir, tag, "after first footer scroll")
+        ctl = locate_control_once(page, job_dir)
+        if ctl:
+            job_log(job_dir, f"Items control found in round {rnd} via [{ctl['how']}].")
+            return ctl
+        job_log(job_dir, f"Round {rnd}/{rounds}: Items control not found yet; waiting 5s (the footer may render "
+                         f"later than the table), then scrolling again.", "WARNING")
+        page.wait_for_timeout(5000)
+    # final inspection before giving up
+    scroll_to_footer(page, job_dir, f"{tag}final")
+    take_shot(page, job_dir, f"shot_{tag}after_scroll_final")
+    diagnose_footer(page, job_dir, tag, "FINAL inspection before giving up")
+    return locate_control_once(page, job_dir)
+
+
+def wait_footer_ready(page, job_dir: Path, timeout=60) -> bool:
+    """After opening CLOSED ALARM: wait (scrolling to the bottom each time) until ANY footer hint shows up."""
+    t0 = time.time()
+    end = t0 + timeout
+    last_log = 0.0
+    while time.time() < end:
+        scroll_to_footer(page, job_dir, "wait-footer", verbose=False, passes=1)
+        try:
+            pag = page.evaluate(PAGINATION_JS, [SELECT_LIKE_CSS])
+            lab = page.evaluate(LABEL_JS, [SELECT_LIKE_CSS])
+            nat = page.evaluate(NATIVE_SELECT_JS)
+        except PWError:
+            pag, lab, nat = {}, None, {"matches": []}
+        if (pag and pag.get("root")) or lab or nat.get("matches"):
+            job_log(job_dir, f"Footer is rendered after {int(time.time() - t0)}s "
+                             f"(pagination root={'yes' if pag and pag.get('root') else 'no'}, "
+                             f"items label={'yes' if lab else 'no'}, native select={'yes' if nat.get('matches') else 'no'}).")
+            return True
+        if time.time() - last_log >= 10:
+            last_log = time.time()
+            job_log(job_dir, f"Waiting for the pagination footer to render... {int(time.time() - t0)}s")
+        page.wait_for_timeout(1000)
+    job_log(job_dir, f"No pagination footer detected after {timeout}s; the full inspection will run next.", "WARNING")
+    return False
+
+
+def choose_size(page, job_dir: Path, size: str, tag: str = ""):
+    """Locate the Items control again (page may have re-rendered), open it and choose `size`."""
+    try:
+        page.keyboard.press("Escape")
+    except PWError:
+        pass
+    scroll_to_footer(page, job_dir, f"{tag}pick{size}", verbose=False, passes=2)
+    ctl = locate_control_once(page, job_dir)
+    if not ctl:
+        raise RuntimeError("the Items control disappeared before selecting the size")
+
+    # native <select>: select directly
+    if ctl["kind"] == "native":
+        loc = page.locator("select[data-pw-items]").first
+        for kw in ({"label": size}, {"value": size}):
+            try:
+                loc.select_option(force=True, timeout=8000, **kw)
+                job_log(job_dir, f"Native <select>: chose {kw}")
+                return True
+            except PWError as exc:
+                job_log(job_dir, f"Native select_option {kw} failed: {str(exc)[:150]}", "WARNING")
+        raise RuntimeError("native select_option failed")
+
+    # custom dropdown: click the control until a list with several sizes is visible
+    offsets = [0.0]
+    if ctl["w"] > 60:
+        offsets += [ctl["w"] / 2 - 16, -ctl["w"] / 4]
+    opts, texts = [], []
+    for dx in offsets:
+        page.mouse.click(ctl["cx"] + dx, ctl["cy"])
+        page.wait_for_timeout(900)
+        opts = page.evaluate(FIND_OPTIONS_JS, [ctl["left"], ctl["cy"]])
         texts = sorted({o["t"] for o in opts}, key=lambda s: int(s))
-        job_log(job_dir, f"Clicked Items box at +{dx}px, visible size entries: {texts}")
-        if len(texts) >= 3:
-            return anchor, opts
+        job_log(job_dir, f"Clicked the Items control (via [{ctl['how']}]) at dx={dx:+.0f}px, "
+                         f"visible size entries: {texts}")
+        if len(texts) >= 3 or (size in texts and len(texts) >= 2):
+            break
         try:
             page.keyboard.press("Escape")
         except PWError:
             pass
         page.wait_for_timeout(300)
-    return anchor, []
-
-
-def select_page_size(page, job_dir: Path, size: str, tag: str = "") -> bool:
-    """Open the dropdown and choose `size`. Returns True when a click/keypress was made."""
-    try:
-        page.keyboard.press("Escape")
-    except PWError:
-        pass
-    anchor, opts = open_items_dropdown(page, job_dir)
     take_shot(page, job_dir, f"shot_{tag}dropdown_open_{size}")
-    cy = (anchor["top"] + anchor["bottom"]) / 2
+
     # 1) click the entry by position
     wanted = [o for o in opts if o["t"] == size]
     if wanted:
@@ -894,10 +1478,22 @@ def select_page_size(page, job_dir: Path, size: str, tag: str = "") -> bool:
         job_log(job_dir, f"Clicking '{size}' at x={o['x']:.0f} y={o['y']:.0f}")
         page.mouse.click(o["x"], o["y"])
         return True
-    # 2) keyboard fallback (works for native selects and most custom listboxes)
+
+    # 2) option element by exact text (Vuetify v-list-item, MUI li[role=option], mat-option, ant-select-item ...)
+    opt_xpath = ("xpath=//*[(self::li or self::div or self::span or self::a or self::mat-option or self::option "
+                 f"or @role='option' or @role='menuitem') and normalize-space(.)='{size}' and not(ancestor::table)]")
+    try:
+        cand = first_visible(page, opt_xpath, 4)
+        job_log(job_dir, f"Option '{size}' found by text; clicking it.")
+        safe_click(cand)
+        return True
+    except (PWError, RuntimeError) as exc:
+        job_log(job_dir, f"Option-by-text lookup for '{size}' failed: {str(exc)[:120]}", "WARNING")
+
+    # 3) keyboard fallback
     idx = SIZE_ORDER.index(size)
     job_log(job_dir, f"Entry '{size}' not visible; using the keyboard (ArrowDown x{idx} + Enter).", "WARNING")
-    page.mouse.click(anchor["right"] + 45, cy)       # make sure the box has focus / is open
+    page.mouse.click(ctl["cx"], ctl["cy"])
     page.wait_for_timeout(500)
     for _ in range(idx):
         page.keyboard.press("ArrowDown")
@@ -919,12 +1515,12 @@ def wait_rows_after_size(page, job_dir: Path, rows_before: int, size: int,
     end = t0 + timeout
     last_n, stable_since, last_log = -1, None, 0.0
     while time.time() < end:
-        n = count_rows(page)
+        n = effective_rows(page)
         now = time.time()
         if n > rows_before:
             if n >= size:
                 page.wait_for_timeout(1500)       # let the last rows render
-                return max(n, count_rows(page))
+                return max(n, effective_rows(page))
             if n == last_n:
                 if stable_since is None:
                     stable_since = now
@@ -942,23 +1538,41 @@ def wait_rows_after_size(page, job_dir: Path, rows_before: int, size: int,
             if rep is not None:
                 rep.running(msg, base_progress, quiet=True)
         page.wait_for_timeout(500)
-    n = count_rows(page)
+    n = effective_rows(page)
     return n if n > rows_before else rows_before
 
 
 def pw_set_page_size(page, job_dir: Path, rep=None, strict=True, tag="", base_progress=0.0) -> int:
     """
-    Pick 500 (or 250 / 100 / 50 as fallback) in the 'Items' dropdown and WAIT until the table really shows
-    more than 10 rows. Returns the number of rows now shown.
+    1) detect the UI framework / virtualization
+    2) scroll to the absolute bottom (window + internal containers), screenshot, dump the footer DOM,
+       enumerate controls, log every locator attempt  (find_items_control)
+    3) choose 500 (or 250 / 100 / 50) and WAIT until the table really shows more than 10 rows
+    Returns the number of rows now shown. Fails only after the inspection above has been completed.
     strict=False: when nothing changes, just warn (used for the re-check after Apply).
     """
-    n0 = count_rows(page)
-    if n0 and n0 < DEFAULT_PAGE_ROWS:
+    detect_site(page, job_dir)
+    n0 = effective_rows(page)
+    if n0 and n0 < DEFAULT_PAGE_ROWS and not SITE_INFO["virtualized"]:
         job_log(job_dir, f"Only {n0} rows in the table: everything fits on one page, page size left as is.")
         return n0
+
+    if rep is not None:
+        rep.running("Scrolling to the table footer and looking for the Items dropdown...", base_progress, quiet=True)
+    ctl = find_items_control(page, job_dir, tag)
+    if ctl is None:
+        take_shot(page, job_dir, f"shot_{tag}items_not_found")
+        msg = ("Could not find the Items-per-page control even after scrolling to the bottom of the table and "
+               "inspecting the DOM. Open Diagnostics: see job.log (lines starting with FOOTER / ENUM / PAGINATION / "
+               "LOCATE / TEXT HITS), the dom_*diag.txt file and the shot_*scroll* screenshots.")
+        if strict:
+            raise RuntimeError(msg)
+        job_log(job_dir, msg, "WARNING")
+        return n0
+
     for size in PAGE_SIZE_CHOICES:
         try:
-            select_page_size(page, job_dir, size, tag)
+            choose_size(page, job_dir, size, tag)
             job_log(job_dir, f"Selected '{size}' in the Items dropdown, waiting for the table to reload "
                              f"(this can take a while)...")
             if rep is not None:
@@ -967,7 +1581,7 @@ def pw_set_page_size(page, job_dir: Path, rep=None, strict=True, tag="", base_pr
             rows_now = wait_rows_after_size(page, job_dir, n0, int(size), rep=rep, base_progress=base_progress)
             wait_loading_done(page)
             page.wait_for_timeout(500)
-            rows_now = max(rows_now, count_rows(page))
+            rows_now = max(rows_now, effective_rows(page))
             if rows_now > n0:
                 job_log(job_dir, f"Page size set to {size}: {rows_now} rows on the page now.")
                 return rows_now
@@ -978,9 +1592,11 @@ def pw_set_page_size(page, job_dir: Path, rep=None, strict=True, tag="", base_pr
             page.keyboard.press("Escape")
         except PWError:
             pass
+    take_shot(page, job_dir, f"shot_{tag}size_not_applied")
     if strict:
-        raise RuntimeError("Could not set Items per page above 10 (see the shot_*dropdown_open_* screenshots "
-                           "and the log). Stopping instead of downloading 10 rows at a time.")
+        raise RuntimeError("The Items control was found but the table never grew above 10 rows (see the "
+                           "shot_*dropdown_open_* screenshots and the LOCATE / Clicked lines in the log). "
+                           "Stopping instead of downloading 10 rows at a time.")
     job_log(job_dir, "Page size could not be raised again (the result may genuinely fit in 10 rows).", "WARNING")
     return n0
 
@@ -1216,7 +1832,7 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
     for d in (dl_dir, pages_dir):
         shutil.rmtree(d, ignore_errors=True)
         d.mkdir(parents=True, exist_ok=True)
-    for pattern in ("shot_*.png", "error.png", "result_*.xlsx", "result.part"):
+    for pattern in ("shot_*.png", "error.png", "dom_*.txt", "result_*.xlsx", "result.part"):
         for old in job_dir.glob(pattern):
             old.unlink(missing_ok=True)
 
@@ -1259,6 +1875,10 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
                 pw_click_closed_alarm_tab(page, job_dir)
                 take_shot(page, job_dir, "shot_0_closed_alarm_tab")
 
+                monitor.phase = "footer-wait"
+                rep.running("Waiting for the table footer (pagination) to render...", 0.22)
+                wait_footer_ready(page, job_dir, timeout=60)
+
                 # ---- 3) Items per page -> 500 (wait until the table really shows the bigger page)
                 monitor.phase = "page-size"
                 rep.running("Setting items per page to 500 (this may take a while, please wait)...", 0.24)
@@ -1279,7 +1899,7 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
                 wait_table_change(page, table_sig(rows_before), APPLY_LOAD_TIMEOUT)
                 wait_loading_done(page)
                 page.wait_for_timeout(1000)
-                rows_after = count_rows(page)
+                rows_after = effective_rows(page)
                 job_log(job_dir, f"After Apply the table shows {rows_after} rows.")
 
                 # The site may reset "Items" to 10 when the filter is applied: check and re-select 500.
@@ -1464,6 +2084,9 @@ def render_workflow(job_dir: Path, job_id: str):
         if all_lines:
             st.download_button("Download full log (job.log)", data="\n".join(all_lines),
                                file_name=f"job_{job_id}.log", mime="text/plain", on_click="ignore", key="dl_log")
+        for dom in sorted(job_dir.glob("dom_*.txt")):
+            st.download_button(f"Download {dom.name} (footer DOM dump)", data=dom.read_bytes(),
+                               file_name=dom.name, mime="text/plain", on_click="ignore", key=f"dl_{dom.name}")
         for shot in sorted(job_dir.glob("shot_*.png")):
             st.image(str(shot), caption=shot.stem)
     if st.button("🗑️ Delete my files & start over", disabled=busy):
