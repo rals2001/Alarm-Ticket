@@ -1,10 +1,16 @@
 """
-PMT Alarm – Closed Alarm downloader (2 visible steps, Playwright edition)
+PMT Alarm – Closed Alarm downloader (Playwright edition)
 
-STEP 1  Retrieve   -> login in Chromium, open CLOSED ALARM, fill Start/End Date, Apply, set Items per page (500),
-                      then for every page: Download Alarm > By Page (one file per page), click next page, repeat.
-                      All page files are compiled into ONE Excel file.
-STEP 3  Download   -> hand the compiled XLSX to the browser (no processing)
+NEW FLOW (Step 1)
+  1. Login
+  2. Open the CLOSED ALARM tab
+  3. Find the "Items" dropdown and choose 500 instead of 10
+     (can take a while: the script WAITS until the table really shows the bigger page, not 10 rows)
+  4. Type Start Date / End Date and click Apply
+     (if the site resets the page size after Apply, 500 is selected again and verified)
+  5. For every page: Download Alarm > By Page (one file per page), click next page, repeat.
+     All page files are compiled into ONE Excel file.
+STEP 3  Download -> hand the compiled XLSX to the browser (no processing)
 
 All state lives on disk in a per-session job folder (not only in st.session_state),
 so it survives websocket reconnects and page refreshes (the job id is kept in the URL).
@@ -46,7 +52,7 @@ LOGIN_URL = "https://pmt-alarm.komdigi.go.id/auth/login"
 ALARM_URL = "https://pmt-alarm.komdigi.go.id/dashboard/alarm"
 DEFAULT_TIMEOUT = 40          # seconds for normal waits
 JOBS_ROOT = Path(tempfile.gettempdir()) / "pmt_alarm_jobs"
-STALE_AFTER = 600             # a "running" step with no heartbeat for 5 min = interrupted
+STALE_AFTER = 600             # a "running" step with no heartbeat for 10 min = interrupted
 JOB_MAX_AGE_HOURS = 12
 POLL_SECONDS = 3
 MEM_GUARD_FRACTION = 0.85     # kill Chromium when the container reaches 85 % of its memory limit
@@ -57,9 +63,12 @@ BLOCK_IMAGES = True
 SITE_UTC_OFFSET_HOURS = 7     # the site works in WIB (UTC+7)
 DATE_INPUT_FORMAT = "%d-%m-%Y"        # how the Start/End Date boxes display dates (02-10-2026)
 PAGE_SIZE_CHOICES = ("500", "250", "100", "50")  # tried in this order in the "Items" dropdown (site offers 10/50/100/250/500)
+DEFAULT_PAGE_ROWS = 10        # rows the site shows before a bigger page size is chosen
 MAX_PAGES = 3000              # safety cap for the pagination loop
 DOWNLOAD_TIMEOUT = 240        # seconds to wait for ONE "By Page" file
-PAGE_SIZE_LOAD_TIMEOUT = 60   # seconds to wait for the table to reload after choosing a bigger page size
+PAGE_SIZE_LOAD_TIMEOUT = 240  # seconds to wait for the table to grow after choosing a bigger page size (be patient)
+PAGE_SIZE_STABLE_SECONDS = 6  # a partial table (fewer rows than chosen size) must stay unchanged this long
+APPLY_LOAD_TIMEOUT = 90       # seconds to wait for the table to reload after Apply
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 # =========================================================
@@ -143,7 +152,6 @@ def cleanup_old_jobs():
                 shutil.rmtree(d, ignore_errors=True)
         except OSError:
             pass
-
 
 
 # =====================================================================
@@ -693,6 +701,13 @@ READ_TABLE_JS = "() => {" + _FIND_TABLE + r"""
   return {heads, rows};
 }"""
 
+COUNT_ROWS_JS = "() => {" + _FIND_TABLE + r"""
+  const table = findTable();
+  if (!table) return -1;
+  return Array.from(table.querySelectorAll('tbody tr'))
+      .filter(tr => tr.querySelectorAll('td').length >= 3 && (tr.innerText || '').trim()).length;
+}"""
+
 TOTAL_PAGES_JS = "() => {" + _FIND_TABLE + r"""
   const table = findTable();
   if (!table) return 0;
@@ -750,6 +765,14 @@ def read_table(page):
         seen[h] = n + 1
         headers.append(h if n == 0 else f"{h}_{n + 1}")
     return headers, rows
+
+
+def count_rows(page) -> int:
+    """Cheap row counter (does not copy every cell back to Python, so it is fine for 500-row tables)."""
+    try:
+        return max(0, int(page.evaluate(COUNT_ROWS_JS)))
+    except (PWError, TypeError, ValueError):
+        return 0
 
 
 def table_sig(rows):
@@ -855,14 +878,14 @@ def open_items_dropdown(page, job_dir: Path):
     return anchor, []
 
 
-def select_page_size(page, job_dir: Path, size: str) -> bool:
+def select_page_size(page, job_dir: Path, size: str, tag: str = "") -> bool:
     """Open the dropdown and choose `size`. Returns True when a click/keypress was made."""
     try:
         page.keyboard.press("Escape")
     except PWError:
         pass
     anchor, opts = open_items_dropdown(page, job_dir)
-    take_shot(page, job_dir, f"shot_2a_dropdown_open_{size}")
+    take_shot(page, job_dir, f"shot_{tag}dropdown_open_{size}")
     cy = (anchor["top"] + anchor["bottom"]) / 2
     # 1) click the entry by position
     wanted = [o for o in opts if o["t"] == size]
@@ -883,33 +906,83 @@ def select_page_size(page, job_dir: Path, size: str) -> bool:
     return True
 
 
-def pw_set_page_size(page, job_dir: Path):
-    """Pick 500 (or 250 / 100 / 50 as fallback) in the 'Items' dropdown. Returns the number of rows now shown."""
-    _, rows0 = read_table(page)
-    n0 = len(rows0)
-    if n0 and n0 < 10:
-        return n0  # everything already fits on one page
-    old = table_sig(rows0)
+def wait_rows_after_size(page, job_dir: Path, rows_before: int, size: int,
+                         timeout=PAGE_SIZE_LOAD_TIMEOUT, rep=None, base_progress=0.0) -> int:
+    """
+    PATIENT wait after choosing a bigger page size. Returns when:
+      * the table shows `size` rows (e.g. 500)                      -> done right away, or
+      * the table shows more than before and has stayed unchanged for PAGE_SIZE_STABLE_SECONDS
+        (the date range simply has fewer rows than `size`).
+    Returns the number of rows finally on screen (rows_before if nothing changed before the timeout).
+    """
+    t0 = time.time()
+    end = t0 + timeout
+    last_n, stable_since, last_log = -1, None, 0.0
+    while time.time() < end:
+        n = count_rows(page)
+        now = time.time()
+        if n > rows_before:
+            if n >= size:
+                page.wait_for_timeout(1500)       # let the last rows render
+                return max(n, count_rows(page))
+            if n == last_n:
+                if stable_since is None:
+                    stable_since = now
+                elif now - stable_since >= PAGE_SIZE_STABLE_SECONDS:
+                    return n
+            else:
+                stable_since = None
+        else:
+            stable_since = None
+        last_n = n
+        if now - last_log >= 10:
+            last_log = now
+            msg = f"Waiting for the table to show {size} rows... now {n} rows ({int(now - t0)}s)"
+            job_log(job_dir, msg)
+            if rep is not None:
+                rep.running(msg, base_progress, quiet=True)
+        page.wait_for_timeout(500)
+    n = count_rows(page)
+    return n if n > rows_before else rows_before
+
+
+def pw_set_page_size(page, job_dir: Path, rep=None, strict=True, tag="", base_progress=0.0) -> int:
+    """
+    Pick 500 (or 250 / 100 / 50 as fallback) in the 'Items' dropdown and WAIT until the table really shows
+    more than 10 rows. Returns the number of rows now shown.
+    strict=False: when nothing changes, just warn (used for the re-check after Apply).
+    """
+    n0 = count_rows(page)
+    if n0 and n0 < DEFAULT_PAGE_ROWS:
+        job_log(job_dir, f"Only {n0} rows in the table: everything fits on one page, page size left as is.")
+        return n0
     for size in PAGE_SIZE_CHOICES:
         try:
-            select_page_size(page, job_dir, size)
-            job_log(job_dir, f"Selected '{size}' in the Items dropdown, waiting for the table to reload...")
-            wait_table_change(page, old, PAGE_SIZE_LOAD_TIMEOUT)
+            select_page_size(page, job_dir, size, tag)
+            job_log(job_dir, f"Selected '{size}' in the Items dropdown, waiting for the table to reload "
+                             f"(this can take a while)...")
+            if rep is not None:
+                rep.running(f"Selected {size} items per page, waiting for the table to load...",
+                            base_progress, quiet=True)
+            rows_now = wait_rows_after_size(page, job_dir, n0, int(size), rep=rep, base_progress=base_progress)
             wait_loading_done(page)
-            page.wait_for_timeout(800)
-            _, rows = read_table(page)
-            if len(rows) > n0:
-                job_log(job_dir, f"Page size set to {size}: {len(rows)} rows on the page now.")
-                return len(rows)
-            job_log(job_dir, f"Page size {size} did not change the table ({len(rows)} rows).", "WARNING")
+            page.wait_for_timeout(500)
+            rows_now = max(rows_now, count_rows(page))
+            if rows_now > n0:
+                job_log(job_dir, f"Page size set to {size}: {rows_now} rows on the page now.")
+                return rows_now
+            job_log(job_dir, f"Page size {size} did not change the table ({rows_now} rows).", "WARNING")
         except (PWError, RuntimeError) as exc:
             job_log(job_dir, f"Page size {size} failed: {str(exc)[:200]}", "WARNING")
         try:
             page.keyboard.press("Escape")
         except PWError:
             pass
-    raise RuntimeError("Could not set Items per page above 10 (see the shot_2a_dropdown_open_* screenshots "
-                       "and the log). Stopping instead of downloading 10 rows at a time.")
+    if strict:
+        raise RuntimeError("Could not set Items per page above 10 (see the shot_*dropdown_open_* screenshots "
+                           "and the log). Stopping instead of downloading 10 rows at a time.")
+    job_log(job_dir, "Page size could not be raised again (the result may genuinely fit in 10 rows).", "WARNING")
+    return n0
 
 
 # =====================================================================
@@ -971,12 +1044,13 @@ def download_all_pages(page, job_dir: Path, pages_dir: Path, rep: StepReporter, 
     if not rows:
         raise RuntimeError("The table is empty for this date range (no closed alarms found).")
     total_pages = max(1, page.evaluate(TOTAL_PAGES_JS))
+    job_log(job_dir, f"Starting page download: {len(rows)} rows on screen, ~{total_pages} page(s).")
 
     while True:
         page_no += 1
         total_pages = max(total_pages, page_no, page.evaluate(TOTAL_PAGES_JS))
         rep.running(f"Page {page_no} of ~{total_pages}: downloading 'By Page' ({len(rows)} rows on screen)...",
-                    0.40 + 0.50 * min((page_no - 1) / total_pages, 1.0))
+                    0.46 + 0.44 * min((page_no - 1) / total_pages, 1.0))
         dest = pw_download_by_page(page, job_dir, pages_dir / f"page_{page_no:04d}")
         digest = file_sha256(dest)
         if digest in seen_hashes:
@@ -1132,7 +1206,8 @@ def compile_files(files, out_path: Path, job_dir: Path, rep: StepReporter) -> in
 
 
 # =====================================================================
-#  STEP 1 worker – filters, per-page downloads, compile
+#  STEP 1 worker
+#  login -> CLOSED ALARM -> Items 500 -> dates -> Apply -> download page by page -> compile
 # =====================================================================
 def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, end_d: date):
     rep = StepReporter(job_dir, 1)
@@ -1169,40 +1244,58 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
                 page.set_default_timeout(DEFAULT_TIMEOUT * 1000)
                 attach_diagnostics(job_dir, browser, page)
 
+                # ---- 1) LOGIN
                 monitor.phase = "login"
                 rep.running("Logging in...", 0.10)
                 pw_login(page, username, password)
 
                 monitor.phase = "alarm-page"
-                rep.running("Opening alarm page...", 0.16)
+                rep.running("Opening alarm page...", 0.15)
                 pw_open_alarm_page(page)
                 pw_scroll_to_alarm_section(page)
 
+                # ---- 2) CLOSED ALARM tab
                 rep.running("Opening CLOSED ALARM tab...", 0.20)
                 pw_click_closed_alarm_tab(page, job_dir)
                 take_shot(page, job_dir, "shot_0_closed_alarm_tab")
 
+                # ---- 3) Items per page -> 500 (wait until the table really shows the bigger page)
+                monitor.phase = "page-size"
+                rep.running("Setting items per page to 500 (this may take a while, please wait)...", 0.24)
+                rows_now = pw_set_page_size(page, job_dir, rep=rep, strict=True, tag="2a_", base_progress=0.26)
+                take_shot(page, job_dir, "shot_1_after_page_size")
+                rep.running(f"Items per page set: {rows_now} rows on screen.", 0.32)
+
+                # ---- 4) Dates + Apply
                 monitor.phase = "filters"
-                rep.running(f"Setting Start Date {start_d:%d-%m-%Y} and End Date {end_d:%d-%m-%Y}...", 0.24)
+                rep.running(f"Setting Start Date {start_d:%d-%m-%Y} and End Date {end_d:%d-%m-%Y}...", 0.34)
                 pw_set_date(page, job_dir, "Start Date", start_d)
                 pw_set_date(page, job_dir, "End Date", end_d)
-                take_shot(page, job_dir, "shot_1_filters")
+                take_shot(page, job_dir, "shot_2_filters")
 
                 _, rows_before = read_table(page)
-                rep.running("Applying the filter...", 0.28)
+                rep.running("Applying the filter (waiting for the table to reload)...", 0.38)
                 pw_click_apply(page)
-                wait_table_change(page, table_sig(rows_before), 25)
+                wait_table_change(page, table_sig(rows_before), APPLY_LOAD_TIMEOUT)
                 wait_loading_done(page)
-                page.wait_for_timeout(800)
+                page.wait_for_timeout(1000)
+                rows_after = count_rows(page)
+                job_log(job_dir, f"After Apply the table shows {rows_after} rows.")
 
-                rep.running("Setting items per page to 500...", 0.33)
-                pw_set_page_size(page, job_dir)
-                take_shot(page, job_dir, "shot_2_after_page_size")
+                # The site may reset "Items" to 10 when the filter is applied: check and re-select 500.
+                if rows_after == DEFAULT_PAGE_ROWS:
+                    job_log(job_dir, "Table shows exactly 10 rows after Apply: the page size may have been "
+                                     "reset, selecting 500 again...", "WARNING")
+                    rep.running("Page size looks reset to 10 after Apply, selecting 500 again...", 0.42)
+                    rows_after = pw_set_page_size(page, job_dir, rep=rep, strict=False,
+                                                  tag="3a_", base_progress=0.42)
+                take_shot(page, job_dir, "shot_3_after_apply")
 
+                # ---- 5) Download page by page
                 monitor.phase = "download-pages"
-                rep.running("Downloading page by page...", 0.40)
+                rep.running(f"Downloading page by page ({rows_after} rows per page)...", 0.46)
                 files, pages = download_all_pages(page, job_dir, pages_dir, rep, monitor, browser)
-                take_shot(page, job_dir, "shot_3_last_page")
+                take_shot(page, job_dir, "shot_4_last_page")
             except Exception:
                 job_log(job_dir, "State at failure: " + format_snapshot(collect_snapshot(dl_dir)), "ERROR")
                 if page is not None:
@@ -1304,8 +1397,9 @@ def render_workflow(job_dir: Path, job_id: str):
 
     # ------------------------------------------------------------ STEP 1
     st.subheader("Step 1 · Retrieve closed alarms")
-    st.caption("Logs in, opens CLOSED ALARM, fills Start/End Date, sets 500 items per page, then clicks "
-               "Download Alarm › By Page on every page and compiles all files into one Excel.")
+    st.caption("Logs in, opens CLOSED ALARM, sets 500 items per page (waits until the table really shows them), "
+               "fills Start/End Date and clicks Apply, then clicks Download Alarm › By Page on every page "
+               "and compiles all files into one Excel.")
     show_status(s1)
     if s1["state"] == "error" and (job_dir / "error.png").exists():
         st.image(str(job_dir / "error.png"), caption="Browser screenshot when the error happened")
