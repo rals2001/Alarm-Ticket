@@ -1,32 +1,33 @@
 """
 PMT Alarm – Closed Alarm downloader (Playwright edition) – PER-PAGE CYCLE EDITION
 
-WHY THIS VERSION
-  The site resets "Items per page" (and possibly the dates) when it moves to the next page.
-  So every page is now fetched in its OWN clean cycle:
-
-    for every page N:
-      1. reload the alarm page (re-login only if the session was lost)
-      2. open the CLOSED ALARM tab
-      3. type Start Date / End Date and click Apply
-      4. set Items per page to 500 (waits until the table really shows it)
-      5. go to page N (page-number buttons / next)  -- skipped for page 1
-      6. verify the table really shows page N at full page size
-      7. Download Alarm > By Page
-      8. last page? -> stop, otherwise repeat for N+1
-
-  All page files are compiled into ONE Excel file.
+The site resets "Items per page" when the table moves to another page, so the page size can NOT be set once.
+NEW FLOW, repeated for EVERY page N:
+  1. DATA FIRST : type Start/End Date (3 commit strategies: Tab / Enter / JS events), click Apply
+                  and VERIFY THE FILTER: the dates inside the table rows must fall in the chosen range
+  2. ROW SIZE   : set Items per page to 500 (the table shows 500 rows); the filter is verified again,
+                  because changing the page size may reload the table without the dates
+  3. NAVIGATE   : for N > 1 click page N (page-number button, or Next until it is reached);
+                  if the size resets to 10 on the way, 500 is selected again; the footer range
+                  ("501-1000 of ...") is used to VERIFY that the table really shows page N
+  4. DOWNLOAD   : Download Alarm > By Page (one file per page); the dates inside the downloaded file are
+                  checked too (the first files stop the job immediately if they contain tickets from outside
+                  the range, e.g. 2021, instead of downloading 250+ useless pages)
+  then go back to step 1 for page N+1, until the last page.
+All page files are compiled into ONE Excel file.
 STEP 3  Download -> hand the compiled XLSX to the browser (no processing)
 
 MEMORY MANAGEMENT (kept from the previous version)
-  * Memory guard on the container WORKING SET (memory.current - inactive_file), kills ONLY Chromium.
-  * Downloads are deleted from Playwright's own store after save_as.
-  * JS handles are disposed, tiny JS signatures are used for change detection.
-  * Browser recycling on memory pressure / crashes: because every page is a fresh cycle, a restart simply
-    logs in again and continues with the next page (no skipping needed).
-  * While a step is running the UI only shows the last 40 log lines.
+  * Guard measures the container WORKING SET (memory.current - inactive_file), 93 %, 3 samples in a row,
+    kills only Chromium.
+  * downloads are deleted from Playwright's store, JS handles are disposed, light-weight page-change signature,
+    fonts/images/media blocked, small JPEG screenshots, capped requestfailed logging.
+  * Browser RECYCLING: on memory pressure Chromium is closed and relaunched. Because every page already starts
+    with its own login-free cycle (dates -> 500 -> go to page N), resuming at page N is cheap.
+  * Per-page diagnostics (memory before/after, rows inside the downloaded file vs rows on screen).
 
-All state lives on disk in a per-session job folder, so it survives websocket reconnects and page refreshes.
+All state lives on disk in a per-session job folder (not only in st.session_state),
+so it survives websocket reconnects and page refreshes (the job id is kept in the URL).
 """
 import csv
 import faulthandler
@@ -73,6 +74,12 @@ MONITOR_INTERVAL = 2          # seconds between diagnostic samples
 BLOCK_IMAGES = True           # also blocks media + fonts
 MEM_LIMIT_MB_OVERRIDE = float(os.environ.get("MEM_LIMIT_MB", 0)) or None
 
+# ---- per-page cycle -----------------------------------------------------
+REAPPLY_EVERY_PAGE = True     # True = for every page: dates -> Apply -> 500 -> go to page N (the requested flow)
+APPLY_QUICK_TIMEOUT = 10      # seconds to wait for a visible change after Apply (cycles after the first one)
+MAX_NAV_STEPS = 120           # max clicks to reach page N
+CYCLE_RETRIES = 2             # a failed page cycle is retried this many times inside the same browser session
+
 # ---- memory management -------------------------------------------------
 MEM_GUARD_FRACTION = 0.93     # HARD guard: working set above 93 % of the limit ...
 MEM_GUARD_SAMPLES = 3         # ... for this many consecutive samples (x MONITOR_INTERVAL s) kills Chromium
@@ -80,9 +87,8 @@ SOFT_RECYCLE_FRACTION = 0.80  # SOFT limit: after a page, recycle the browser if
 CHROMIUM_GROWTH_MB = 450      # ... or if Chromium RSS grew this much since the first page of the session
 RECYCLE_MIN_PAGES = 3         # never recycle before this many pages were downloaded in a session
 RECYCLE_EVERY_PAGES = 0       # >0 = also recycle the browser every N pages (0 = only on memory pressure)
-MAX_RECYCLES = 200            # planned recycles (memory pressure) allowed per job
+MAX_RECYCLES = 80             # planned recycles (memory pressure) allowed per job
 MAX_CRASH_RESTARTS = 6        # unplanned restarts (crash / guard trip / error) that made progress
-PAGE_ATTEMPTS = 3             # how many times one page cycle is retried before the session fails
 PROBE_FIRST_PAGES = 3         # verify the real row count inside the first N downloaded files ...
 PROBE_EVERY = 25              # ... and then every N pages
 
@@ -94,9 +100,13 @@ MAX_PAGES = 3000              # safety cap for the pagination loop
 DOWNLOAD_TIMEOUT = 240        # seconds to wait for ONE "By Page" file
 PAGE_SIZE_LOAD_TIMEOUT = 240  # seconds to wait for the table to grow after choosing a bigger page size
 PAGE_SIZE_STABLE_SECONDS = 6  # a partial table (fewer rows than chosen size) must stay unchanged this long
-APPLY_LOAD_TIMEOUT_FIRST = 90 # seconds to wait for the table to reload after Apply (first page)
-APPLY_LOAD_TIMEOUT_NEXT = 25  # ... on later cycles (the table may legitimately look identical)
-GOTO_STEP_TIMEOUT = 60        # seconds to wait for the table to change after ONE navigation click
+APPLY_LOAD_TIMEOUT = 60       # seconds to wait for the table to reload after the FIRST Apply of a session
+APPLY_RETRY_TIMEOUT = 30      # seconds to wait after an Apply that is repeated because the filter was not active
+
+# ---- date filter verification ---------------------------------------------
+VERIFY_FILTER = True          # check the dates inside the table rows AND inside every downloaded file
+FILTER_TOLERANCE_DAYS = 1     # a row date may be this many days outside the range (time zones / end of day)
+FATAL_FILE_PAGES = 2          # a downloaded file outside the range on pages <= this stops the whole job
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 # =========================================================
@@ -109,6 +119,10 @@ log = logging.getLogger("pmt_alarm")
 faulthandler.enable()
 
 _INSTALL_LOCK = threading.Lock()
+
+
+class FatalJobError(RuntimeError):
+    """An error that must stop the job at once (no page-cycle retry, no browser restart)."""
 
 
 # =====================================================================
@@ -606,15 +620,10 @@ def pw_login(page, username, password):
         )
 
 
-def pw_open_alarm_page(page, job_dir: Path, creds: dict):
-    """Open the alarm dashboard (a fresh load = clean filters). Logs in again if the session was lost."""
+def pw_open_alarm_page(page):
     page.goto(ALARM_URL, wait_until="load", timeout=60000)
     if "/auth/login" in page.url:
-        job_log(job_dir, "Session lost (redirected to login): logging in again.", "WARNING")
-        pw_login(page, creds["username"], creds["password"])
-        page.goto(ALARM_URL, wait_until="load", timeout=60000)
-        if "/auth/login" in page.url:
-            raise RuntimeError("Redirected back to login page; session not authenticated.")
+        raise RuntimeError("Redirected back to login page; session not authenticated.")
     page.wait_for_selector("body", state="attached")
     page.wait_for_timeout(2000)
 
@@ -668,7 +677,7 @@ def wait_loading_done(page, timeout=10000):
         pass
 
 
-def pw_click_closed_alarm_tab(page, job_dir: Path, verbose=True):
+def pw_click_closed_alarm_tab(page, job_dir: Path):
     click_first(page, CLOSED_TAB_XPATHS, "CLOSED ALARM tab")
     # wait until the Closed Alarm table (header has Site ID + Severity) is really on screen
     end = time.time() + 60
@@ -682,10 +691,9 @@ def pw_click_closed_alarm_tab(page, job_dir: Path, verbose=True):
         page.wait_for_timeout(500)
     if not headers:
         raise RuntimeError("The CLOSED ALARM table did not appear after clicking the tab.")
-    if verbose:
-        job_log(job_dir, f"Closed Alarm table detected, columns: {headers}")
+    job_log(job_dir, f"Closed Alarm table detected, columns: {headers}")
     wait_loading_done(page, 20000)
-    page.wait_for_timeout(3000)   # the pagination footer may render later than the table
+    page.wait_for_timeout(4000)   # the pagination footer may render later than the table
 
 
 # =====================================================================
@@ -735,7 +743,7 @@ MARK_CONTROL_JS = "(kind) => {" + _FIND_TABLE + r"""
     target = inputs[0];
   } else if (kind === 'apply') {
     const btns = Array.from(document.querySelectorAll('button, [role="button"]'))
-      .filter(el => vis(el) && before(el) && (el.innerText || '').replace(/\s+/g, ' ').trim().toUpperCase() === 'APPLY');
+      .filter(el => vis(el) && before(el) && /^APPLY( FILTERS?)?$/.test((el.innerText || '').replace(/\s+/g, ' ').trim().toUpperCase()));
     target = btns[btns.length - 1];
   } else if (kind === 'items') {
     const labels = all.filter(el => vis(el) && after(el) && own(el) === 'items');
@@ -764,8 +772,16 @@ def mark_control(page, kind: str, timeout=DEFAULT_TIMEOUT):
     raise RuntimeError(f"Could not find the '{kind}' control next to the Closed Alarm table (result: {res}).")
 
 
-def pw_set_date(page, job_dir: Path, label: str, value: date, verbose=True):
-    """Type a date into the Closed Alarm 'Start Date' / 'End Date' box and verify what the page holds."""
+DATE_STRATEGIES = ("tab", "enter", "js")
+_DATE_MODES = {
+    "tab": ("typed", "digits"),                 # type the date, press Tab
+    "enter": ("typed+enter", "digits+enter"),   # type the date, press Enter, then Tab (commits date-pickers)
+    "js": ("js", "js+enter"),                   # set the value + input/change/blur events, optionally Enter
+}
+
+
+def pw_set_date(page, job_dir: Path, label: str, value: date, strategy: str = "tab"):
+    """Put a date into the Closed Alarm 'Start Date' / 'End Date' box and verify what the box holds."""
     text = value.strftime(DATE_INPUT_FORMAT)
     want = re.sub(r"\D", "", text)
     kind = "start" if label.lower().startswith("start") else "end"
@@ -773,16 +789,21 @@ def pw_set_date(page, job_dir: Path, label: str, value: date, verbose=True):
     inp.wait_for(state="visible", timeout=DEFAULT_TIMEOUT * 1000)
     inp.scroll_into_view_if_needed()
     last = ""
-    for mode in ("typed", "digits", "js"):
+    for mode in _DATE_MODES.get(strategy, _DATE_MODES["tab"]):
         try:
             inp = mark_control(page, kind, 10)
-            if mode == "js":
+            if mode.startswith("js"):
+                inp.click()
                 inp.evaluate(JS_SET_VALUE, text)
             else:
                 inp.click()
                 inp.press("Control+A")
                 inp.press("Backspace")
-                inp.press_sequentially(text if mode == "typed" else want, delay=50)
+                inp.press_sequentially(text if mode.startswith("typed") else want, delay=50)
+            if mode.endswith("+enter"):
+                inp.press("Enter")
+                page.wait_for_timeout(300)
+                inp = mark_control(page, kind, 10)
             inp.press("Tab")
             page.wait_for_timeout(400)
             last = mark_control(page, kind, 10).input_value()
@@ -790,11 +811,32 @@ def pw_set_date(page, job_dir: Path, label: str, value: date, verbose=True):
             job_log(job_dir, f"[{label}] mode={mode} error: {str(exc)[:120]}", "WARNING")
             continue
         if re.sub(r"\D", "", last) == want:
-            if verbose:
-                job_log(job_dir, f"[{label}] (Closed Alarm filter) set to '{last}' (mode={mode})")
+            job_log(job_dir, f"[{label}] (Closed Alarm filter) set to '{last}' (strategy={strategy}, mode={mode})")
             return
         job_log(job_dir, f"[{label}] mode={mode} left '{last}' instead of '{text}'", "WARNING")
     raise RuntimeError(f"Could not set {label} to {text} (the box shows '{last}').")
+
+
+def _box_digits(page, kind: str) -> str:
+    try:
+        return re.sub(r"\D", "", mark_control(page, kind, 10).input_value())
+    except (PWError, RuntimeError):
+        return ""
+
+
+def set_dates(page, job_dir: Path, start_d: date, end_d: date, strategy: str, force: bool):
+    """Fill both date boxes. force=False skips a box that already shows the wanted date."""
+    items = (("Start Date", start_d, "start"), ("End Date", end_d, "end"))
+    for label, value, kind in items:
+        want = re.sub(r"\D", "", value.strftime(DATE_INPUT_FORMAT))
+        if not force and _box_digits(page, kind) == want:
+            continue
+        pw_set_date(page, job_dir, label, value, strategy)
+    for label, value, kind in items:          # typing the 2nd date may have reset the 1st one: re-check both
+        want = re.sub(r"\D", "", value.strftime(DATE_INPUT_FORMAT))
+        if _box_digits(page, kind) != want:
+            job_log(job_dir, f"[{label}] changed while typing the other date; typing it again.", "WARNING")
+            pw_set_date(page, job_dir, label, value, strategy)
 
 
 def pw_click_apply(page):
@@ -818,6 +860,23 @@ COUNT_ROWS_JS = "() => {" + _FIND_TABLE + r"""
       .filter(tr => tr.querySelectorAll('td').length >= 3 && (tr.innerText || '').trim()).length;
 }"""
 
+# A handful of rows (first 3, last 3, 4 spread in the middle) with their cell texts: used to check the dates.
+SAMPLE_ROWS_JS = "() => {" + _FIND_TABLE + r"""
+  const t = findTable();
+  if (!t) return null;
+  const clean = x => (x || '').replace(/\s+/g, ' ').trim();
+  const heads = Array.from(t.querySelectorAll('thead th')).map(th => clean(th.innerText));
+  const trs = Array.from(t.querySelectorAll('tbody tr'))
+      .filter(tr => tr.querySelectorAll('td').length >= 3 && (tr.innerText || '').trim());
+  const n = trs.length;
+  const idx = new Set();
+  [0, 1, 2, n - 3, n - 2, n - 1].forEach(i => { if (i >= 0 && i < n) idx.add(i); });
+  for (let k = 1; k <= 4; k++) idx.add(Math.floor(n * k / 5));
+  const rows = Array.from(idx).filter(i => i >= 0 && i < n).sort((a, b) => a - b)
+      .map(i => Array.from(trs[i].querySelectorAll('td')).map(td => clean(td.innerText)));
+  return {heads: heads, rows: rows, n: n};
+}"""
+
 # Tiny signature of the table (row count + first row + last row). Computed INSIDE the browser,
 # so a 500-row table is never copied to Python while we wait for a page change.
 SIG_JS = "() => {" + _FIND_TABLE + r"""
@@ -835,6 +894,9 @@ TOTAL_PAGES_JS = "() => {" + _FIND_TABLE + r"""
   let max = 0;
   document.querySelectorAll('button, a, li, [role="button"]').forEach(el => {
     if (table.contains(el) || !(table.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) return;
+    if (el.closest('[role="listbox"], [role="option"], [role="menu"], [role="combobox"], select, .v-select, .v-field, ' +
+                   '.v-overlay, .v-menu, .MuiPopover-root, .MuiSelect-select, .ant-select, mat-select, ' +
+                   '.cdk-overlay-container')) return;
     const t = (el.innerText || '').trim();
     if (/^\d{1,5}$/.test(t)) max = Math.max(max, parseInt(t, 10));
   });
@@ -859,24 +921,6 @@ FIND_NEXT_JS = "() => {" + _FIND_TABLE + r"""
   return noDigit.length ? noDigit[noDigit.length - 1] : null;
 }"""
 
-# The page-number button that gets us closest to `target` without passing it:
-# the highest visible number n with  current < n <= target.
-FIND_PAGE_BTN_JS = "([target, cur]) => {" + _FIND_TABLE + r"""
-  const table = findTable();
-  if (!table) return null;
-  const after = el => !table.contains(el) && (table.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
-  const vis = el => el.offsetParent !== null || el.getClientRects().length > 0;
-  let best = null, bestN = -1;
-  document.querySelectorAll('button, a, li, [role="button"]').forEach(el => {
-    if (!after(el) || !vis(el)) return;
-    const t = (el.innerText || '').trim();
-    if (!/^\d{1,5}$/.test(t)) return;
-    const n = parseInt(t, 10);
-    if (n > cur && n <= target && n >= bestN) { best = el; bestN = n; }   // >= : prefer the inner <button> over its <li>
-  });
-  return best;
-}"""
-
 IS_DISABLED_JS = r"""
 el => {
   const cls = n => ((n && n.className && n.className.toString) ? n.className.toString() : '').toLowerCase();
@@ -885,6 +929,44 @@ el => {
             || /disabled/.test(cls(el)) || (p && /disabled/.test(cls(p))));
 }
 """
+
+# Page-number buttons below the Closed Alarm table. Marks the one to click with data-pw-page.
+#   mode 'exact' : the button with the wanted number is visible
+#   mode 'jump'  : it is not visible, so the visible button closest BELOW the target (and above the current page)
+#   mode 'none'  : nothing useful -> the caller clicks "Next"
+# `cur` is the active page number (0 = could not be detected). Call with target=0 to only read `cur`.
+MARK_PAGE_JS = "(target) => {" + _FIND_TABLE + r"""
+  document.querySelectorAll('[data-pw-page]').forEach(e => e.removeAttribute('data-pw-page'));
+  const table = findTable();
+  if (!table) return {mode: 'no-table', cur: 0, digits: []};
+  const after = el => !table.contains(el) && (table.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
+  const vis = el => el.offsetParent !== null || el.getClientRects().length > 0;
+  const tokens = e => ((e && e.className && e.className.toString) ? e.className.toString() : '').split(/\s+/);
+  const isAct = e => {
+    if (!e || !e.getAttribute) return false;
+    const ac = e.getAttribute('aria-current');
+    if (ac && ac !== 'false') return true;
+    if (e.getAttribute('aria-selected') === 'true') return true;
+    return tokens(e).some(t => /(^|[-_])(active|selected|current)$/i.test(t));
+  };
+  const EXCL = '[role="listbox"], [role="option"], [role="menu"], [role="combobox"], select, .v-select, .v-field, ' +
+               '.v-overlay, .v-menu, .MuiPopover-root, .MuiSelect-select, .ant-select, mat-select, .cdk-overlay-container';
+  let els = Array.from(document.querySelectorAll('button, a, li, [role="button"]'))
+      .filter(el => after(el) && vis(el) && !el.closest(EXCL) && /^\d{1,5}$/.test((el.innerText || '').trim()));
+  els = els.filter(el => !els.some(o => o !== el && el.contains(o)));   // keep the deepest element only
+  const digits = els.map(el => ({n: parseInt(el.innerText.trim(), 10), el: el,
+                                 act: isAct(el) || isAct(el.parentElement)}));
+  const actEl = digits.find(d => d.act);
+  const cur = actEl ? actEl.n : 0;
+  let pick = digits.find(d => d.n === target), mode = 'exact';
+  if (!pick) {
+    pick = digits.filter(d => d.n < target && d.n > cur).sort((a, b) => b.n - a.n)[0];
+    mode = 'jump';
+  }
+  if (!pick) return {mode: 'none', cur: cur, digits: digits.map(d => d.n)};
+  pick.el.setAttribute('data-pw-page', '1');
+  return {mode: mode, cur: cur, digits: digits.map(d => d.n)};
+}"""
 
 _ICON_TAIL_RE = re.compile(r"\s+(info|info_outline|help|help_outline|arrow_upward|arrow_downward|unfold_more)$", re.I)
 
@@ -922,7 +1004,7 @@ def get_sig(page) -> str:
 
 
 def wait_sig_change(page, old, timeout=40, poll_ms=700):
-    """Light-weight page-change detection: compares a tiny signature computed inside the browser."""
+    """Light-weight change detection: waits until the table signature differs from `old` and is stable."""
     end = time.time() + timeout
     while time.time() < end:
         s = get_sig(page)
@@ -936,11 +1018,141 @@ def wait_sig_change(page, old, timeout=40, poll_ms=700):
 
 
 # ---------------------------------------------------------------------
+#  Date-filter verification: do the rows really belong to the chosen Start/End Date?
+# ---------------------------------------------------------------------
+_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "mei": 5, "jun": 6, "jul": 7, "aug": 8, "agu": 8,
+           "agt": 8, "ags": 8, "sep": 9, "oct": 10, "okt": 10, "nov": 11, "nop": 11, "dec": 12, "des": 12}
+_D1 = re.compile(r"(?<!\d)(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)")          # 2026-10-02
+_D2 = re.compile(r"(?<!\d)(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})(?!\d)")          # 02-10-2026 / 02/10/2026
+_D3 = re.compile(r"(?<!\d)(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})(?!\d)")    # 2 Oct 2026 / 2 Okt 2026
+
+
+def _mk_date(y, m, d):
+    try:
+        if 2000 <= y <= 2100:
+            return date(y, m, d)
+    except ValueError:
+        pass
+    return None
+
+
+def cell_dates(cell) -> list:
+    """All dates found in one cell (datetime/date objects or text in the usual formats)."""
+    if cell is None:
+        return []
+    if isinstance(cell, datetime):
+        return [cell.date()]
+    if isinstance(cell, date):
+        return [cell]
+    if not isinstance(cell, str):
+        return []
+    out = []
+    for y, m, d in _D1.findall(cell):
+        x = _mk_date(int(y), int(m), int(d))
+        if x:
+            out.append(x)
+    for a, b, y in _D2.findall(cell):
+        x = _mk_date(int(y), int(b), int(a)) or _mk_date(int(y), int(a), int(b))   # dd-mm first, then mm-dd
+        if x:
+            out.append(x)
+    for d, mon, y in _D3.findall(cell):
+        m = _MONTHS.get(mon[:3].lower())
+        x = _mk_date(int(y), m, int(d)) if m else None
+        if x:
+            out.append(x)
+    return out
+
+
+def judge_rows(rows, start_d: date, end_d: date):
+    """
+    Returns (ok, info). ok=True: the sampled rows carry dates inside the range. ok=False: most sampled rows have
+    NO date inside the range (unfiltered data, e.g. tickets from 2021). ok=None: no date-like cells at all.
+    """
+    lo = start_d - timedelta(days=FILTER_TOLERANCE_DAYS)
+    hi = end_d + timedelta(days=FILTER_TOLERANCE_DAYS)
+    checked = bad = 0
+    seen = []
+    for row in rows:
+        ds = []
+        for c in row:
+            ds.extend(cell_dates(c))
+        if not ds:
+            continue
+        checked += 1
+        seen.extend(ds)
+        if not any(lo <= d <= hi for d in ds):
+            bad += 1
+    if checked == 0:
+        return None, "no date-like cells in the sampled rows, the filter cannot be verified"
+    span = f"{min(seen):%d-%m-%Y}..{max(seen):%d-%m-%Y}"
+    if bad * 2 > checked:
+        return False, (f"{bad} of {checked} sampled rows have no date inside {start_d:%d-%m-%Y}..{end_d:%d-%m-%Y} "
+                       f"(dates seen: {span})")
+    return True, f"{checked - bad} of {checked} sampled rows are inside the range (dates seen: {span})"
+
+
+def verify_screen(page, job_dir: Path, start_d: date, end_d: date, log_sample=False):
+    """Check the rows currently shown in the Closed Alarm table. Returns (ok|None, info)."""
+    if not VERIFY_FILTER:
+        return True, "verification disabled"
+    try:
+        data = page.evaluate(SAMPLE_ROWS_JS)
+    except PWError as exc:
+        return None, f"could not read the table: {str(exc)[:100]}"
+    if not data or not data.get("rows"):
+        return None, "no rows to check"
+    if log_sample:
+        job_log(job_dir, f"FILTER SAMPLE headers={data.get('heads')}")
+        job_log(job_dir, f"FILTER SAMPLE first row={data['rows'][0]}")
+        job_log(job_dir, f"FILTER SAMPLE last row={data['rows'][-1]}")
+    return judge_rows(data["rows"], start_d, end_d)
+
+
+def verify_file(path: Path, start_d: date, end_d: date):
+    """Check the dates inside a downloaded XLSX page file. Returns (ok|None, info)."""
+    if not VERIFY_FILTER:
+        return True, "verification disabled"
+    if path.suffix.lower() != ".xlsx":
+        return None, f"{path.suffix} file, not checked"
+    try:
+        wb = load_workbook(path, read_only=True, data_only=True)
+    except Exception as exc:
+        return None, f"cannot open the file: {str(exc)[:100]}"
+    rows, header_seen = [], False
+    try:
+        for row in wb.worksheets[0].iter_rows(values_only=True):
+            vals = list(row)
+            if not header_seen:
+                if sum(1 for v in vals if v not in (None, "")) >= 3:
+                    header_seen = True
+                continue
+            if any(v not in (None, "") for v in vals):
+                rows.append(vals)
+    except Exception as exc:
+        return None, f"cannot read the file: {str(exc)[:100]}"
+    finally:
+        wb.close()
+    if not rows:
+        return None, "no data rows in the file"
+    n = len(rows)
+    idx = sorted({0, 1, 2, n - 3, n - 2, n - 1} | {n * k // 5 for k in range(1, 5)})
+    return judge_rows([rows[i] for i in idx if 0 <= i < n], start_d, end_d)
+
+
+# ---------------------------------------------------------------------
 #  "Items" dropdown (10 / 50 / 100 / 250 / 500) -- FOOTER DISCOVERY EDITION
-#  (unchanged: this part already works)
+#  (locator logic unchanged: it already works; only the logging can be silenced for the per-page cycles)
 # ---------------------------------------------------------------------
 SIZE_ORDER = ["10", "50", "100", "250", "500"]
-SITE_INFO = {"framework": "generic", "virtualized": False}
+SITE_INFO = {"framework": "generic", "virtualized": False, "quiet": False}
+
+
+def llog(job_dir: Path, msg: str, level: str = "INFO"):
+    """job_log that can be silenced (INFO only) during the 250+ per-page cycles."""
+    if SITE_INFO.get("quiet") and level == "INFO":
+        return
+    job_log(job_dir, msg, level)
+
 
 SELECT_LIKE_CSS = (
     "select, [role='combobox'], [role='listbox'], [aria-haspopup='listbox'], mat-select, "
@@ -1213,12 +1425,28 @@ TEXT_HITS_JS = "() => {" + _FIND_TABLE + r"""
   return {hits: out.slice(0, 30), docH: document.documentElement.scrollHeight, bodyTail: (document.body.innerText || '').slice(-500)};
 }"""
 
-PAGE_RANGE_JS = r"""() => {
-  const els = document.querySelectorAll("tfoot, [class*='pagination' i], [class*='footer' i], mat-paginator, " +
-                                        ".MuiTablePagination-root, .q-table__bottom, .ant-pagination");
-  for (const el of els) {
+# Footer range text such as "501-1000 of 128,345" -- anchored to the Closed Alarm table (the Daily Analytics
+# tables have their own footers and must be ignored).
+PAGE_RANGE_JS = "() => {" + _FIND_TABLE + r"""
+  const table = findTable();
+  if (!table) return null;
+  const re = /(\d[\d.,]*)\s*[-\u2013\u2014]\s*(\d[\d.,]*)\s*(?:of|dari|\/)\s*(\d[\d.,]*)/i;
+  const after = el => table.contains(el) ? !!el.closest('tfoot')
+                                          : !!(table.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
+  const sel = "tfoot, [class*='pagination' i], [class*='footer' i], mat-paginator, .MuiTablePagination-root, " +
+              ".q-table__bottom, .ant-pagination";
+  for (const el of document.querySelectorAll(sel)) {
+    if (!after(el)) continue;
     const t = (el.innerText || '');
-    const m = t.match(/(\d[\d.,]*)\s*[-\u2013\u2014]\s*(\d[\d.,]*)\s*(?:of|dari|\/)\s*(\d[\d.,]*)/i);
+    if (t.length > 600) continue;
+    const m = t.match(re);
+    if (m) return [m[1], m[2], m[3]];
+  }
+  for (const el of document.querySelectorAll('body *')) {          // fallback: any small element below the table
+    if (el.children.length > 3 || !after(el)) continue;
+    const t = (el.innerText || '').trim();
+    if (!t || t.length > 60) continue;
+    const m = t.match(re);
     if (m) return [m[1], m[2], m[3]];
   }
   return null;
@@ -1282,7 +1510,7 @@ def detect_site(page, job_dir: Path, verbose=True) -> dict:
 
 
 def read_range(page):
-    """Footer text like '1-500 of 12345' -> (1, 500, 12345), or None."""
+    """(first, last, total) from the footer text below the Closed Alarm table, or None."""
     try:
         r = page.evaluate(PAGE_RANGE_JS)
     except PWError:
@@ -1409,7 +1637,7 @@ def _point(how, left, top, w, h):
 
 def locate_control_once(page, job_dir: Path):
     """
-    Try every strategy once and log each attempt. Returns
+    Try every strategy once and log each attempt (INFO lines are silenced when SITE_INFO['quiet']). Returns
       {'kind': 'native', ...}  for a real <select> that contains the sizes, or
       {'kind': 'point', cx, cy, ...} for a custom dropdown (click by coordinates), or None.
     """
@@ -1417,80 +1645,80 @@ def locate_control_once(page, job_dir: Path):
         info = page.evaluate(NATIVE_SELECT_JS)
         if info["matches"]:
             m = info["matches"][-1]
-            job_log(job_dir, f"LOCATE [native <select>] -> FOUND options={m['vals']} current='{m['value']}' "
-                             f"({info['total']} selects on page)")
+            llog(job_dir, f"LOCATE [native <select>] -> FOUND options={m['vals']} current='{m['value']}' "
+                          f"({info['total']} selects on page)")
             return {"kind": "native", "how": "native select"}
-        job_log(job_dir, f"LOCATE [native <select>] -> none ({info['total']} <select> elements, none with page sizes)")
+        llog(job_dir, f"LOCATE [native <select>] -> none ({info['total']} <select> elements, none with page sizes)")
     except PWError as exc:
-        job_log(job_dir, f"LOCATE [native <select>] -> error {str(exc)[:120]}", "WARNING")
+        llog(job_dir, f"LOCATE [native <select>] -> error {str(exc)[:120]}", "WARNING")
 
     for name, css in ITEMS_SELECTORS:
         try:
             loc = page.locator(css)
             n = loc.count()
             vis = [i for i in range(min(n, 8)) if loc.nth(i).is_visible()]
-            job_log(job_dir, f"LOCATE [{name}] css='{css[:80]}' -> {n} match(es), {len(vis)} visible")
+            llog(job_dir, f"LOCATE [{name}] css='{css[:80]}' -> {n} match(es), {len(vis)} visible")
             if vis:
                 el = loc.nth(vis[-1])
                 el.scroll_into_view_if_needed(timeout=3000)
                 box = el.bounding_box()
                 if box:
-                    job_log(job_dir, f"LOCATE [{name}] -> USING it at x={box['x']:.0f} y={box['y']:.0f} "
-                                     f"{box['width']:.0f}x{box['height']:.0f}")
+                    llog(job_dir, f"LOCATE [{name}] -> USING it at x={box['x']:.0f} y={box['y']:.0f} "
+                                  f"{box['width']:.0f}x{box['height']:.0f}")
                     return _point(name, box["x"], box["y"], box["width"], box["height"])
         except PWError as exc:
-            job_log(job_dir, f"LOCATE [{name}] -> error {str(exc)[:120]}", "WARNING")
+            llog(job_dir, f"LOCATE [{name}] -> error {str(exc)[:120]}", "WARNING")
 
     try:
         res = page.evaluate(LABEL_JS, [SELECT_LIKE_CSS])
         if not res:
-            job_log(job_dir, "LOCATE [text label] -> no 'Items'/'per page'/'Rows per page'/'Tampilkan' label below the table")
+            llog(job_dir, "LOCATE [text label] -> no 'Items'/'per page'/'Rows per page'/'Tampilkan' label below the table")
         else:
             lab = res["label"]
-            job_log(job_dir, f"LOCATE [text label] -> label '{lab['text']}' <{lab['tag']} class='{lab['cls']}'> "
-                             f"at x={lab['left']:.0f} y={lab['top']:.0f}; html: {res['html'][:500]}")
+            llog(job_dir, f"LOCATE [text label] -> label '{lab['text']}' <{lab['tag']} class='{lab['cls']}'> "
+                          f"at x={lab['left']:.0f} y={lab['top']:.0f}; html: {res['html'][:500]}")
             if res.get("control"):
                 c = res["control"]
-                job_log(job_dir, f"LOCATE [text label] -> USING select-like <{c['tag']} class='{c['cls']}'> "
-                                 f"(found {res['level']} level(s) above the label)")
+                llog(job_dir, f"LOCATE [text label] -> USING select-like <{c['tag']} class='{c['cls']}'> "
+                              f"(found {res['level']} level(s) above the label)")
                 return _point("label+control", c["left"], c["top"], c["w"], c["h"])
-            job_log(job_dir, "LOCATE [text label] -> no select-like element next to the label; "
-                             "will click to the right of the label", "WARNING")
+            llog(job_dir, "LOCATE [text label] -> no select-like element next to the label; "
+                          "will click to the right of the label", "WARNING")
             h = max(20.0, lab["bottom"] - lab["top"])
             return _point("label-offset", lab["right"] + 10, lab["top"], 70, h)
     except PWError as exc:
-        job_log(job_dir, f"LOCATE [text label] -> error {str(exc)[:120]}", "WARNING")
+        llog(job_dir, f"LOCATE [text label] -> error {str(exc)[:120]}", "WARNING")
 
     try:
         pag = page.evaluate(PAGINATION_JS, [SELECT_LIKE_CSS])
         if not pag.get("root"):
-            job_log(job_dir, f"LOCATE [pagination-first] -> no pagination container "
-                             f"(page-number buttons={pag.get('digits')}, named containers={pag.get('named')})")
+            llog(job_dir, f"LOCATE [pagination-first] -> no pagination container "
+                          f"(page-number buttons={pag.get('digits')}, named containers={pag.get('named')})")
         else:
-            job_log(job_dir, f"LOCATE [pagination-first] -> pagination root <{pag['root']['tag']} "
-                             f"class='{pag['root']['cls']}'> via {pag['root']['how']}")
+            llog(job_dir, f"LOCATE [pagination-first] -> pagination root <{pag['root']['tag']} "
+                          f"class='{pag['root']['cls']}'> via {pag['root']['how']}")
             if pag.get("control"):
                 c = pag["control"]
-                job_log(job_dir, f"LOCATE [pagination-first] -> USING select-like <{c['tag']} class='{c['cls']}'> "
-                                 f"text='{c['text']}' (ancestor level {pag['level']})")
+                llog(job_dir, f"LOCATE [pagination-first] -> USING select-like <{c['tag']} class='{c['cls']}'> "
+                              f"text='{c['text']}' (ancestor level {pag['level']})")
                 return _point("pagination+control", c["left"], c["top"], c["w"], c["h"])
-            job_log(job_dir, "LOCATE [pagination-first] -> no select-like control inside the pagination container "
-                             "or its 5 ancestors", "WARNING")
+            llog(job_dir, "LOCATE [pagination-first] -> no select-like control inside the pagination container "
+                          "or its 5 ancestors", "WARNING")
     except PWError as exc:
-        job_log(job_dir, f"LOCATE [pagination-first] -> error {str(exc)[:120]}", "WARNING")
+        llog(job_dir, f"LOCATE [pagination-first] -> error {str(exc)[:120]}", "WARNING")
 
     try:
         els = page.evaluate(ENUM_JS, [SELECT_LIKE_CSS])
         hits = [e for e in els if e["selectLike"] and e["w"] >= 30 and e["h"] >= 16
                 and re.fullmatch(r"(10|50|100|250|500)", re.sub(r"\D", "", e["text"]) or "x") and len(e["text"]) <= 12]
-        job_log(job_dir, f"LOCATE [shows-a-page-size] -> {len(els)} candidates near the bottom, {len(hits)} look like "
-                         f"a size selector")
+        llog(job_dir, f"LOCATE [shows-a-page-size] -> {len(els)} candidates near the bottom, {len(hits)} look like "
+                      f"a size selector")
         if hits:
             e = hits[-1]
-            job_log(job_dir, f"LOCATE [shows-a-page-size] -> USING <{e['tag']} class='{e['cls']}'> text='{e['text']}'")
+            llog(job_dir, f"LOCATE [shows-a-page-size] -> USING <{e['tag']} class='{e['cls']}'> text='{e['text']}'")
             return _point("shows-a-page-size", e["left"], e["top"], e["w"], e["h"])
     except PWError as exc:
-        job_log(job_dir, f"LOCATE [shows-a-page-size] -> error {str(exc)[:120]}", "WARNING")
+        llog(job_dir, f"LOCATE [shows-a-page-size] -> error {str(exc)[:120]}", "WARNING")
     return None
 
 
@@ -1557,10 +1785,10 @@ def choose_size(page, job_dir: Path, size: str, tag: str = ""):
         for kw in ({"label": size}, {"value": size}):
             try:
                 loc.select_option(force=True, timeout=8000, **kw)
-                job_log(job_dir, f"Native <select>: chose {kw}")
+                llog(job_dir, f"Native <select>: chose {kw}")
                 return True
             except PWError as exc:
-                job_log(job_dir, f"Native select_option {kw} failed: {str(exc)[:150]}", "WARNING")
+                llog(job_dir, f"Native select_option {kw} failed: {str(exc)[:150]}", "WARNING")
         raise RuntimeError("native select_option failed")
 
     offsets = [0.0]
@@ -1572,8 +1800,8 @@ def choose_size(page, job_dir: Path, size: str, tag: str = ""):
         page.wait_for_timeout(900)
         opts = page.evaluate(FIND_OPTIONS_JS, [ctl["left"], ctl["cy"]])
         texts = sorted({o["t"] for o in opts}, key=lambda s: int(s))
-        job_log(job_dir, f"Clicked the Items control (via [{ctl['how']}]) at dx={dx:+.0f}px, "
-                         f"visible size entries: {texts}")
+        llog(job_dir, f"Clicked the Items control (via [{ctl['how']}]) at dx={dx:+.0f}px, "
+                      f"visible size entries: {texts}")
         if len(texts) >= 3 or (size in texts and len(texts) >= 2):
             break
         try:
@@ -1581,12 +1809,13 @@ def choose_size(page, job_dir: Path, size: str, tag: str = ""):
         except PWError:
             pass
         page.wait_for_timeout(300)
-    take_shot(page, job_dir, f"shot_{tag}dropdown_open_{size}")
+    if not SITE_INFO.get("quiet"):
+        take_shot(page, job_dir, f"shot_{tag}dropdown_open_{size}")
 
     wanted = [o for o in opts if o["t"] == size]
     if wanted:
         o = sorted(wanted, key=lambda o: o["w"] * o["h"])[0]
-        job_log(job_dir, f"Clicking '{size}' at x={o['x']:.0f} y={o['y']:.0f}")
+        llog(job_dir, f"Clicking '{size}' at x={o['x']:.0f} y={o['y']:.0f}")
         page.mouse.click(o["x"], o["y"])
         return True
 
@@ -1594,14 +1823,14 @@ def choose_size(page, job_dir: Path, size: str, tag: str = ""):
                  f"or @role='option' or @role='menuitem') and normalize-space(.)='{size}' and not(ancestor::table)]")
     try:
         cand = first_visible(page, opt_xpath, 4)
-        job_log(job_dir, f"Option '{size}' found by text; clicking it.")
+        llog(job_dir, f"Option '{size}' found by text; clicking it.")
         safe_click(cand)
         return True
     except (PWError, RuntimeError) as exc:
-        job_log(job_dir, f"Option-by-text lookup for '{size}' failed: {str(exc)[:120]}", "WARNING")
+        llog(job_dir, f"Option-by-text lookup for '{size}' failed: {str(exc)[:120]}", "WARNING")
 
     idx = SIZE_ORDER.index(size)
-    job_log(job_dir, f"Entry '{size}' not visible; using the keyboard (ArrowDown x{idx} + Enter).", "WARNING")
+    llog(job_dir, f"Entry '{size}' not visible; using the keyboard (ArrowDown x{idx} + Enter).", "WARNING")
     page.mouse.click(ctl["cx"], ctl["cy"])
     page.wait_for_timeout(500)
     for _ in range(idx):
@@ -1613,7 +1842,7 @@ def choose_size(page, job_dir: Path, size: str, tag: str = ""):
 
 def wait_rows_after_size(page, job_dir: Path, rows_before: int, size: int,
                          timeout=PAGE_SIZE_LOAD_TIMEOUT, rep=None, base_progress=0.0) -> int:
-    """PATIENT wait after choosing a bigger page size (full size, or a partial table that stays stable)."""
+    """PATIENT wait after choosing a bigger page size (full size, or a stable partial table)."""
     t0 = time.time()
     end = t0 + timeout
     last_n, stable_since, last_log = -1, None, 0.0
@@ -1645,9 +1874,10 @@ def wait_rows_after_size(page, job_dir: Path, rows_before: int, size: int,
     return n if n > rows_before else rows_before
 
 
-def pw_set_page_size(page, job_dir: Path, rep=None, strict=True, tag="", base_progress=0.0) -> int:
-    """Find the Items control, choose 500 (or 250 / 100 / 50) and WAIT until the table really shows more rows."""
-    detect_site(page, job_dir, verbose=(tag.startswith("p1_") or strict))
+def pw_set_page_size(page, job_dir: Path, rep=None, strict=True, tag="", base_progress=0.0, sizes=None) -> int:
+    """FULL version (with footer inspection / screenshots): find the Items control, choose 500 and WAIT for the rows."""
+    sizes = tuple(sizes) if sizes else PAGE_SIZE_CHOICES
+    detect_site(page, job_dir)
     n0 = effective_rows(page)
     if n0 and n0 < DEFAULT_PAGE_ROWS and not SITE_INFO["virtualized"]:
         job_log(job_dir, f"Only {n0} rows in the table: everything fits on one page, page size left as is.")
@@ -1666,7 +1896,7 @@ def pw_set_page_size(page, job_dir: Path, rep=None, strict=True, tag="", base_pr
         job_log(job_dir, msg, "WARNING")
         return n0
 
-    for size in PAGE_SIZE_CHOICES:
+    for size in sizes:
         try:
             choose_size(page, job_dir, size, tag)
             job_log(job_dir, f"Selected '{size}' in the Items dropdown, waiting for the table to reload "
@@ -1693,29 +1923,207 @@ def pw_set_page_size(page, job_dir: Path, rep=None, strict=True, tag="", base_pr
         raise RuntimeError("The Items control was found but the table never grew above 10 rows (see the "
                            "shot_*dropdown_open_* screenshots and the LOCATE / Clicked lines in the log). "
                            "Stopping instead of downloading 10 rows at a time.")
-    job_log(job_dir, "Page size could not be raised (the result may genuinely fit in 10 rows).", "WARNING")
+    job_log(job_dir, "Page size could not be raised again (the result may genuinely fit in 10 rows).", "WARNING")
     return n0
 
 
-# =====================================================================
-#  Pagination: go to page N, verify position, download "By Page"
-# =====================================================================
-BY_PAGE_XPATH = (f"xpath=//*[(self::button or self::a or self::li or self::span or self::div "
-                 f"or @role='menuitem') and {UPPER}='BY PAGE']")
-
-
-def find_next(page):
-    """Returns (element_handle_or_None, disabled). The CALLER must dispose the returned handle."""
-    handle = page.evaluate_handle(FIND_NEXT_JS)
-    el = handle.as_element()
-    if el is None:
-        _dispose(handle)
-        return None, True
+def quick_set_size(page, job_dir: Path, size: int, rep=None, base_progress=0.0) -> int:
+    """
+    LIGHT version used in every per-page cycle: no screenshots, no DOM dumps, INFO logging silenced.
+    Chooses exactly `size` (the size chosen on page 1, so the page maths stay valid). If that fails the FULL
+    version runs once as a fallback (it logs everything). Returns the rows now shown.
+    """
+    n0 = effective_rows(page)
+    if n0 > DEFAULT_PAGE_ROWS:
+        return n0
+    SITE_INFO["quiet"] = True
     try:
-        return el, bool(el.evaluate(IS_DISABLED_JS))
-    except PWError:
-        _dispose(el)
-        return None, True
+        for attempt in (1, 2):
+            try:
+                choose_size(page, job_dir, str(size), "q_")
+                rows_now = wait_rows_after_size(page, job_dir, n0, size, rep=rep, base_progress=base_progress)
+                wait_loading_done(page)
+                page.wait_for_timeout(300)
+                rows_now = max(rows_now, effective_rows(page))
+                if rows_now > n0:
+                    return rows_now
+                job_log(job_dir, f"Quick page-size attempt {attempt}: table still shows {rows_now} rows.", "WARNING")
+            except (PWError, RuntimeError) as exc:
+                job_log(job_dir, f"Quick page-size attempt {attempt} failed: {str(exc)[:160]}", "WARNING")
+            try:
+                page.keyboard.press("Escape")
+            except PWError:
+                pass
+    finally:
+        SITE_INFO["quiet"] = False
+    job_log(job_dir, "Quick page-size selection failed; running the full version with diagnostics.", "WARNING")
+    return pw_set_page_size(page, job_dir, rep=rep, strict=True, tag="fb_", base_progress=base_progress,
+                            sizes=(str(size),))
+
+
+# =====================================================================
+#  Apply filter, page navigation, page cycle
+# =====================================================================
+def apply_filters(page, job_dir: Path, timeout: float):
+    """Click Apply and wait (up to `timeout` s) for the table to reload."""
+    old = get_sig(page)
+    pw_click_apply(page)
+    changed = wait_sig_change(page, old, timeout)
+    wait_loading_done(page)
+    page.wait_for_timeout(1000)
+    job_log(job_dir, f"Apply clicked: table changed={changed}, rows now {effective_rows(page)}")
+
+
+def ensure_size(page, job_dir: Path, state: dict, rep, prog: float) -> int:
+    """Make the table show the job's page size (500). The first call discovers the control with diagnostics."""
+    rows = effective_rows(page)
+    size = state["page_size"]
+    if size is None:
+        if rows > DEFAULT_PAGE_ROWS:
+            size = rows
+            job_log(job_dir, f"Page size already shows {rows} rows after Apply; using {rows} as the page size.")
+        else:
+            rows = pw_set_page_size(page, job_dir, rep=rep, strict=True, tag="2a_", base_progress=prog)
+            size = max(rows, 1)
+            if state["session_no"] == 1 and not state.get("shot_size"):
+                state["shot_size"] = True
+                take_shot(page, job_dir, "shot_1_after_page_size")
+        state["page_size"] = size
+        job_log(job_dir, f"PAGE SIZE for this job: {size} rows per page.")
+    elif size > DEFAULT_PAGE_ROWS and rows <= DEFAULT_PAGE_ROWS:
+        quick_set_size(page, job_dir, size, rep=rep, base_progress=prog)
+    return size
+
+
+def prepare_filtered_table(page, job_dir: Path, rep, state: dict, start_d: date, end_d: date,
+                           first_cycle: bool, prog: float) -> int:
+    """
+    DATA FIRST, THEN ROW SIZE, and prove that the date filter is really active:
+      dates -> Apply -> (rows == 0 ?) -> 500 rows -> check the row dates -> (lost? Apply again, 500 again) -> check
+    If the rows do not belong to the chosen range the next date-commit strategy is tried (Tab / Enter / JS events).
+    """
+    known = state["date_strategy"]
+    order = ([known] if known else []) + [x for x in DATE_STRATEGIES if x != known]
+    fails = []
+    for i, strat in enumerate(order, 1):
+        first_try = i == 1
+        force = first_cycle or not first_try
+        if first_cycle or not first_try:
+            job_log(job_dir, f"FILTER attempt {i}/{len(order)}: dates via [{strat}], force_typing={force}")
+        set_dates(page, job_dir, start_d, end_d, strat, force)
+        apply_filters(page, job_dir, APPLY_LOAD_TIMEOUT if (first_cycle and first_try)
+                      else APPLY_QUICK_TIMEOUT if first_try else APPLY_RETRY_TIMEOUT)
+
+        rows = effective_rows(page)
+        if rows == 0:
+            page.wait_for_timeout(3000)
+            rows = effective_rows(page)
+        if rows == 0:
+            raise FatalJobError(f"No closed alarms were found between {start_d:%d-%m-%Y} and {end_d:%d-%m-%Y}.")
+
+        size = ensure_size(page, job_dir, state, rep, prog)
+        ok, info = verify_screen(page, job_dir, start_d, end_d, log_sample=first_cycle)
+        if ok is False:
+            job_log(job_dir, f"FILTER CHECK failed after the page size step ({info}); clicking Apply again.",
+                    "WARNING")
+            apply_filters(page, job_dir, APPLY_RETRY_TIMEOUT)
+            size = ensure_size(page, job_dir, state, rep, prog)
+            ok, info = verify_screen(page, job_dir, start_d, end_d, log_sample=first_cycle)
+        if ok is not False:
+            if ok is None:
+                job_log(job_dir, f"FILTER CHECK: {info}. Continuing, the downloaded files are checked as well.",
+                        "WARNING")
+            elif first_cycle or not first_try:
+                job_log(job_dir, f"FILTER CHECK OK via [{strat}]: {info}")
+            if state["date_strategy"] != strat:
+                state["date_strategy"] = strat
+            if first_cycle and state["session_no"] == 1 and not state.get("shot_filter"):
+                state["shot_filter"] = True
+                take_shot(page, job_dir, "shot_3_after_filter")
+            return size
+        job_log(job_dir, f"FILTER CHECK FAILED via [{strat}]: {info}", "ERROR")
+        fails.append(f"[{strat}] {info}")
+        take_shot(page, job_dir, f"shot_filter_failed_{strat}")
+
+    msg = (f"The date filter {start_d:%d-%m-%Y} to {end_d:%d-%m-%Y} does not take effect: the table keeps showing "
+           f"other dates. Tried: " + " | ".join(fails))
+    if known:
+        raise RuntimeError(msg)
+    raise FatalJobError(msg)
+
+
+def current_page(page, size: int) -> int:
+    """Page number currently displayed: from the footer range ('501-1000 of N') or the active page button."""
+    r = read_range(page)
+    if r and size:
+        return (r[0] - 1) // size + 1
+    try:
+        res = page.evaluate(MARK_PAGE_JS, 0)
+        return int(res.get("cur") or 0)
+    except (PWError, TypeError, ValueError):
+        return 0
+
+
+def size_was_reset(page, size: int, target: int, state: dict) -> bool:
+    """True when the table shows <= 10 rows although a bigger page size was chosen and more rows remain."""
+    if size <= DEFAULT_PAGE_ROWS:
+        return False
+    n = effective_rows(page)
+    if n == 0 or n > DEFAULT_PAGE_ROWS:
+        return False
+    r = read_range(page)
+    if r:
+        return (r[2] - r[0] + 1) > n          # more rows remain than are displayed
+    return target < state["total_pages"]
+
+
+def goto_page(page, job_dir: Path, target: int, state: dict, rep, monitor, browser):
+    """Click the page-number button (or Next) until page `target` is displayed. Re-selects 500 if the size resets."""
+    size = state["page_size"]
+    resets = 0
+    for step in range(1, MAX_NAV_STEPS + 1):
+        cur = current_page(page, size)
+        if cur == target:
+            job_log(job_dir, f"NAV: page {target} reached after {step - 1} click(s).")
+            return
+        try:
+            res = page.evaluate(MARK_PAGE_JS, target)
+        except PWError as exc:
+            raise RuntimeError(f"Could not read the page buttons: {str(exc)[:120]}")
+        mode = res.get("mode")
+        old = get_sig(page)
+        if mode in ("exact", "jump"):
+            safe_click(page.locator("[data-pw-page]").first)
+        else:
+            outcome = click_next(page)
+            if outcome != "clicked":
+                raise RuntimeError(f"Cannot reach page {target}: no page button visible and 'Next' is "
+                                   f"'{outcome}' (current page {cur}, visible buttons {res.get('digits')}).")
+        changed = wait_sig_change(page, old, 40)
+        wait_loading_done(page, 15000)
+        page.wait_for_timeout(500)
+        n_rows = effective_rows(page)
+        job_log(job_dir, f"NAV step {step}: target={target} was_on={cur} click={mode if mode != 'none' else 'next'} "
+                         f"table_changed={changed} rows_now={n_rows} buttons={res.get('digits')}")
+        if monitor.tripped:
+            raise RuntimeError(monitor.tripped)
+        if not browser.is_connected() or page.is_closed():
+            raise RuntimeError("Chromium exited while navigating.")
+
+        if size_was_reset(page, size, target, state):
+            resets += 1
+            job_log(job_dir, f"NAV: the page size was RESET to {n_rows} rows after the click "
+                             f"(reset #{resets}); selecting {size} again.", "WARNING")
+            if resets > 4:
+                raise RuntimeError(f"The page size keeps resetting to 10 while navigating to page {target}; "
+                                   f"cannot reach it.")
+            quick_set_size(page, job_dir, size, rep=rep)
+            continue
+
+        if mode == "exact" and changed and current_page(page, size) == 0:
+            job_log(job_dir, f"NAV: clicked page button {target}; the current page cannot be read, assuming success.")
+            return
+    raise RuntimeError(f"Could not reach page {target} within {MAX_NAV_STEPS} clicks.")
 
 
 def click_next(page) -> str:
@@ -1732,49 +2140,25 @@ def click_next(page) -> str:
         _dispose(el)
 
 
-def goto_page(page, job_dir: Path, target: int, rep: StepReporter, monitor, browser, prog_value: float):
-    """
-    From page 1 go to page `target`: click the highest visible page-number button that does not pass the
-    target; if there is none, click 'next'. Every click waits for the table to change.
-    """
-    cur = 1
-    t0 = time.time()
-    job_log(job_dir, f"Navigating from page 1 to page {target}...")
-    while cur < target:
-        old = get_sig(page)
-        handle = page.evaluate_handle(FIND_PAGE_BTN_JS, [target, cur])
-        el = handle.as_element()
-        if el is not None:
-            try:
-                n = _num(el.inner_text())
-            except PWError:
-                n = 0
-            try:
-                safe_click(el)
-            finally:
-                _dispose(el)
-            new_cur = n if n > cur else cur + 1
-            how = f"page-number button {n}"
-        else:
-            _dispose(handle)
-            res = click_next(page)
-            if res != "clicked":
-                raise RuntimeError(f"Could not go to page {target}: the 'next' button state is '{res}' "
-                                   f"while on page {cur}.")
-            new_cur = cur + 1
-            how = "next"
-        if not wait_sig_change(page, old, GOTO_STEP_TIMEOUT, poll_ms=400):
-            raise RuntimeError(f"The table did not change after clicking {how} (stuck at page {cur}, "
-                               f"wanted page {target}).")
-        cur = new_cur
-        if monitor.tripped:
-            raise RuntimeError(monitor.tripped)
-        if not browser.is_connected() or page.is_closed():
-            raise RuntimeError("Chromium exited while navigating.")
-        if cur % 10 == 0 or cur == target:
-            rep.running(f"Navigating to page {target}: now on page {cur} ({int(time.time() - t0)}s)",
-                        prog_value, quiet=True)
-    job_log(job_dir, f"Arrived on page {target} after {int(time.time() - t0)}s.")
+def find_next(page):
+    """Returns (element_handle_or_None, disabled). The CALLER must dispose the returned handle."""
+    handle = page.evaluate_handle(FIND_NEXT_JS)
+    el = handle.as_element()
+    if el is None:
+        _dispose(handle)
+        return None, True
+    try:
+        return el, bool(el.evaluate(IS_DISABLED_JS))
+    except PWError:
+        _dispose(el)
+        return None, True
+
+
+# =====================================================================
+#  Download Alarm > By Page  (one file per page)
+# =====================================================================
+BY_PAGE_XPATH = (f"xpath=//*[(self::button or self::a or self::li or self::span or self::div "
+                 f"or @role='menuitem') and {UPPER}='BY PAGE']")
 
 
 def file_sha256(path: Path) -> str:
@@ -1855,153 +2239,150 @@ def recycle_reason(snap: dict, baseline, session_pages: int):
     return None
 
 
-def verify_position(page, job_dir: Path, page_no: int, state: dict, rep, tag: str, prog_value: float):
+def fetch_page(page, job_dir: Path, dl_dir: Path, pages_dir: Path, rep: StepReporter, monitor, browser,
+               state: dict, n: int, start_d: date, end_d: date, first_cycle: bool) -> bool:
     """
-    After navigating: make sure the table shows page `page_no` at the chosen page size.
-    The footer range ('501-1000 of N') is the main signal; the row count is the fallback.
-    If the page size fell back to 10 on the way, select it again once and re-check.
+    ONE page cycle:  dates -> Apply -> 500 rows -> go to page n -> verify -> Download Alarm > By Page.
+    Returns True when page n was the LAST page.
     """
-    size = state.get("page_size") or 0
-    if page_no <= 1 or not size:
-        return
+    total = max(state["total_pages"], n)
+    prog = 0.46 + 0.44 * min((n - 1) / max(total, 1), 1.0)
+    rep.running(f"Page {n} of ~{total}: dates + Apply, 500 rows, go to page, download...", prog, quiet=True)
+    job_log(job_dir, f"P{n} CYCLE start | {format_snapshot(collect_snapshot(dl_dir))}")
 
-    def check():
-        rng = read_range(page)
-        rows = effective_rows(page)
-        expected_a = (page_no - 1) * size + 1
-        if rng:
-            return rng[0] == expected_a, rng, rows
-        return rows > 0, rng, rows
+    # ---- 1+2) DATA FIRST (dates + Apply, verified), THEN ROW SIZE 500 (filter verified again)
+    if REAPPLY_EVERY_PAGE or first_cycle:
+        size = prepare_filtered_table(page, job_dir, rep, state, start_d, end_d, first_cycle, prog)
+    else:
+        size = ensure_size(page, job_dir, state, rep, prog)
+    rows = effective_rows(page)
+    if rows == 0:
+        raise FatalJobError(f"No closed alarms were found between {start_d:%d-%m-%Y} and {end_d:%d-%m-%Y}.")
+    job_log(job_dir, f"P{n} after dates + Apply + size: {rows} rows on screen (page size {size}).")
 
-    ok, rng, rows = check()
-    job_log(job_dir, f"VERIFY page {page_no}: range={rng} rows={rows} expected_first_row={(page_no - 1) * size + 1} -> "
-                     f"{'OK' if ok else 'MISMATCH'}", "INFO" if ok else "WARNING")
-    if ok and not (rows == DEFAULT_PAGE_ROWS and size > DEFAULT_PAGE_ROWS):
-        return
+    # ---- 3) NAVIGATE to page n (the cycle starts on page 1 after Apply)
+    if n > 1:
+        goto_page(page, job_dir, n, state, rep, monitor, browser)
 
-    job_log(job_dir, f"Page {page_no}: the page size looks reset after navigating ({rows} rows); "
-                     f"selecting the size again.", "WARNING")
-    pw_set_page_size(page, job_dir, rep=rep, strict=False, tag=f"{tag}re_", base_progress=prog_value)
-    ok, rng, rows = check()
-    job_log(job_dir, f"VERIFY (after re-select) page {page_no}: range={rng} rows={rows} -> "
-                     f"{'OK' if ok else 'MISMATCH'}", "INFO" if ok else "ERROR")
-    if not ok:
-        raise RuntimeError(f"After navigating, the table does not show page {page_no} (footer range {rng}, "
-                           f"{rows} rows). Selecting the page size again appears to send the site back to page 1.")
-
-
-def fetch_page(page, job_dir: Path, pages_dir: Path, dl_dir: Path, rep: StepReporter, monitor, browser,
-               state: dict, creds: dict, page_no: int) -> bool:
-    """One complete cycle for page `page_no`. Returns True when this was the last page."""
-    start_d, end_d = creds["start"], creds["end"]
-    total = max(state["total_pages"], page_no)
-    tag = f"p{page_no}_"
-    quiet = page_no > 1
-
-    def prog(x):
-        return 0.05 + 0.85 * min((page_no - 1 + x) / max(total, 1), 1.0)
-
-    job_log(job_dir, f"===== PAGE {page_no} CYCLE START | {format_snapshot(collect_snapshot(dl_dir))}")
-
-    # 1-2. fresh dashboard, CLOSED ALARM tab
-    monitor.phase = "alarm-page"
-    rep.running(f"Page {page_no} of ~{total}: opening the alarm page...", prog(0.00), quiet=quiet)
-    pw_open_alarm_page(page, job_dir, creds)
-    pw_scroll_to_alarm_section(page)
-    rep.running(f"Page {page_no} of ~{total}: opening CLOSED ALARM...", prog(0.10), quiet=True)
-    pw_click_closed_alarm_tab(page, job_dir, verbose=(page_no == 1))
-    if page_no == 1:
-        take_shot(page, job_dir, "shot_0_closed_alarm_tab")
-    monitor.phase = "footer-wait"
-    wait_footer_ready(page, job_dir, timeout=60 if page_no == 1 else 30)
-
-    # 3. dates + Apply
-    monitor.phase = "filters"
-    rep.running(f"Page {page_no} of ~{total}: setting dates {start_d:%d-%m-%Y} to {end_d:%d-%m-%Y} and applying...",
-                prog(0.20), quiet=quiet)
-    pw_set_date(page, job_dir, "Start Date", start_d, verbose=(page_no == 1))
-    pw_set_date(page, job_dir, "End Date", end_d, verbose=(page_no == 1))
-    old_sig = get_sig(page)
-    pw_click_apply(page)
-    wait_sig_change(page, old_sig, APPLY_LOAD_TIMEOUT_FIRST if page_no == 1 else APPLY_LOAD_TIMEOUT_NEXT)
-    wait_loading_done(page)
-    page.wait_for_timeout(1000)
-    job_log(job_dir, f"P{page_no}: after Apply the table shows {effective_rows(page)} rows.")
-    if page_no == 1:
-        take_shot(page, job_dir, "shot_1_after_apply")
-
-    # 4. items per page
-    monitor.phase = "page-size"
-    rep.running(f"Page {page_no} of ~{total}: setting items per page...", prog(0.35), quiet=quiet)
-    rows_now = pw_set_page_size(page, job_dir, rep=rep, strict=False, tag=tag, base_progress=prog(0.35))
+    rows = effective_rows(page)
     rng = read_range(page)
-    if page_no == 1:
-        if rows_now == 0:
-            raise RuntimeError("The table is empty for this date range (no closed alarms found).")
-        if rng and rng[2] > DEFAULT_PAGE_ROWS and rows_now <= DEFAULT_PAGE_ROWS:
-            raise RuntimeError(f"Could not raise the page size above {DEFAULT_PAGE_ROWS} rows "
-                               f"(footer says {rng[2]:,} rows in total).")
-        state["page_size"] = (rng[1] - rng[0] + 1) if rng else rows_now
-        if rng and state["page_size"] > 0:
-            state["total_pages"] = max(1, math.ceil(rng[2] / state["page_size"]))
-        else:
-            state["total_pages"] = max(state["total_pages"], int(page.evaluate(TOTAL_PAGES_JS) or 0), 1)
-        job_log(job_dir, f"PAGE SIZE in use: {state['page_size']} rows; total rows={rng[2] if rng else '?'}; "
-                         f"total pages ~{state['total_pages']}.")
-        take_shot(page, job_dir, "shot_2_after_page_size")
-    elif rows_now == 0:
-        raise RuntimeError(f"The table is empty on page {page_no} after applying the filter.")
-    elif state.get("page_size") and rows_now < state["page_size"] and (not rng or rng[1] < rng[2]):
-        job_log(job_dir, f"P{page_no}: page size shows only {rows_now} rows (expected {state['page_size']}).", "WARNING")
-    total = max(state["total_pages"], page_no)
+    job_log(job_dir, f"P{n} READY rows_on_screen={rows} footer_range={rng} current_page={current_page(page, size)}")
+    if rng and size and rng[0] != (n - 1) * size + 1:
+        raise RuntimeError(f"Wrong page on screen: the footer range starts at row {rng[0]} but page {n} "
+                           f"must start at row {(n - 1) * size + 1}.")
+    if size > DEFAULT_PAGE_ROWS and rows <= DEFAULT_PAGE_ROWS and not (rng and rng[1] >= rng[2]):
+        raise RuntimeError(f"Only {rows} rows are shown for page {n}: the page size is not {size}.")
 
-    # 5-6. go to page N and verify
-    if page_no > 1:
-        monitor.phase = "navigate"
-        rep.running(f"Page {page_no} of ~{total}: navigating...", prog(0.55), quiet=quiet)
-        goto_page(page, job_dir, page_no, rep, monitor, browser, prog(0.55))
-        verify_position(page, job_dir, page_no, state, rep, tag, prog(0.55))
+    screen_ok, screen_info = verify_screen(page, job_dir, start_d, end_d)
+    job_log(job_dir, f"P{n} SCREEN DATE CHECK: {screen_ok} - {screen_info}", "WARNING" if screen_ok is False else "INFO")
+    if screen_ok is False:
+        raise RuntimeError(f"The date filter was lost before downloading page {n}: {screen_info}")
 
-    # 7. download
-    monitor.phase = "download-pages"
-    rep.running(f"Page {page_no} of ~{total}: downloading 'By Page'...", prog(0.70), quiet=quiet)
-    job_log(job_dir, f"P{page_no} BEFORE download | {format_snapshot(collect_snapshot(dl_dir))}")
-    n_screen = count_rows(page)
-    dest = pw_download_by_page(page, job_dir, pages_dir / f"page_{page_no:04d}")
-    job_log(job_dir, f"P{page_no} AFTER download  | {format_snapshot(collect_snapshot(dl_dir))}")
+    # ---- 4) DOWNLOAD
+    job_log(job_dir, f"P{n} BEFORE download | {format_snapshot(collect_snapshot(dl_dir))}")
+    dest = pw_download_by_page(page, job_dir, pages_dir / f"page_{n:04d}")
+    job_log(job_dir, f"P{n} AFTER download  | {format_snapshot(collect_snapshot(dl_dir))}")
+
+    file_ok, file_info = verify_file(dest, start_d, end_d)
+    job_log(job_dir, f"P{n} FILE DATE CHECK: {file_ok} - {file_info}", "WARNING" if file_ok is False else "INFO")
+    if file_ok is False:
+        dest.unlink(missing_ok=True)
+        why = ("the table showed the right dates but the 'By Page' export ignores the filter"
+               if screen_ok else "the date filter is not active")
+        msg = (f"The file downloaded for page {n} contains tickets outside {start_d:%d-%m-%Y}..{end_d:%d-%m-%Y} "
+               f"({why}): {file_info}")
+        if n <= FATAL_FILE_PAGES:
+            raise FatalJobError(msg)
+        raise RuntimeError(msg)
 
     digest = file_sha256(dest)
     if digest in state["hashes"]:
-        job_log(job_dir, f"Page {page_no}: the file is identical to page {state['hashes'][digest]}; skipped.",
-                "WARNING")
         dest.unlink(missing_ok=True)
-    else:
-        state["hashes"][digest] = page_no
-        state["files"].append(dest)
-        job_log(job_dir, f"Page {page_no}: saved {dest.name} ({dest.stat().st_size / 1024:.0f} KB)")
+        raise RuntimeError(f"The file downloaded for page {n} is identical to page {state['hashes'][digest]} "
+                           f"(the table was not on page {n}).")
+    state["hashes"][digest] = n
+    state["files"].append(dest)
+    state["resume_page"] = n + 1
+    job_log(job_dir, f"Page {n}: saved {dest.name} ({dest.stat().st_size / 1024:.0f} KB)")
 
-    if page_no <= PROBE_FIRST_PAGES or page_no % PROBE_EVERY == 0:
-        n_file = probe_xlsx_rows(dest) if dest.exists() else -1
-        level = "WARNING" if n_file not in (-1, n_screen) else "INFO"
-        job_log(job_dir, f"P{page_no} VERIFY file_rows={n_file} screen_rows={n_screen}", level)
+    if n <= PROBE_FIRST_PAGES or n % PROBE_EVERY == 0:
+        n_file = probe_xlsx_rows(dest)
+        n_scr = count_rows(page)
+        level = "WARNING" if n_file not in (-1, n_scr) else "INFO"
+        job_log(job_dir, f"P{n} VERIFY file_rows={n_file} screen_rows={n_scr} size={dest.stat().st_size / 1024:.0f}KB",
+                level)
 
-    # 8. last page?
+    # ---- is this the last page?
+    last = False
     rng = read_range(page)
+    try:
+        if rng and size:
+            state["total_pages"] = max(state["total_pages"], n, math.ceil(rng[2] / size))
+        else:
+            state["total_pages"] = max(state["total_pages"], n, int(page.evaluate(TOTAL_PAGES_JS) or 0))
+    except PWError:
+        pass
     if rng and rng[1] >= rng[2]:
-        job_log(job_dir, f"Page {page_no}: footer range {rng[0]}-{rng[1]} of {rng[2]} -> that was the last page.")
-        return True
-    nxt, disabled = find_next(page)
-    if nxt is None:
-        job_log(job_dir, "No 'next page' button found: assuming this is the only/last page.", "WARNING")
-        return True
-    _dispose(nxt)
-    if disabled:
-        job_log(job_dir, f"'Next' is disabled on page {page_no}: that was the last page.")
-        return True
-    if page_no >= MAX_PAGES:
-        job_log(job_dir, f"Reached the safety cap of {MAX_PAGES} pages.", "WARNING")
-        return True
-    return False
+        last = True
+        job_log(job_dir, f"Page {n}: footer range {rng[0]}-{rng[1]} of {rng[2]} -> this is the last page.")
+    else:
+        nxt, disabled = find_next(page)
+        if nxt is None:
+            job_log(job_dir, "No 'next page' button found: assuming this is the only/last page.", "WARNING")
+            last = True
+        else:
+            _dispose(nxt)
+            if disabled:
+                job_log(job_dir, f"'Next' is disabled on page {n}: that was the last page.")
+                last = True
+    return last
+
+
+def download_loop(page, job_dir: Path, dl_dir: Path, pages_dir: Path, rep: StepReporter, monitor, browser,
+                  state: dict, start_d: date, end_d: date) -> str:
+    """Run page cycles until the last page ('done') or until the browser should be restarted ('recycle')."""
+    session_pages = 0
+    baseline = None
+    while True:
+        n = state["resume_page"]
+        last = False
+        for attempt in range(1, CYCLE_RETRIES + 2):
+            try:
+                last = fetch_page(page, job_dir, dl_dir, pages_dir, rep, monitor, browser, state, n,
+                                  start_d, end_d, first_cycle=(session_pages == 0 and attempt == 1))
+                break
+            except FatalJobError:
+                raise
+            except (PWError, RuntimeError) as exc:
+                if monitor.tripped or not browser.is_connected() or page.is_closed() or attempt > CYCLE_RETRIES:
+                    raise
+                job_log(job_dir, f"P{n} cycle attempt {attempt}/{CYCLE_RETRIES + 1} failed: {str(exc)[:250]} "
+                                 f"-> retrying the whole page cycle.", "WARNING")
+                try:
+                    page.keyboard.press("Escape")
+                except PWError:
+                    pass
+                page.wait_for_timeout(2000)
+        session_pages += 1
+
+        snap = collect_snapshot(dl_dir)
+        job_log(job_dir, f"P{n} DONE            | {format_snapshot(snap)}")
+        if baseline is None:
+            baseline = snap["chrom_rss"]
+        if monitor.tripped:
+            raise RuntimeError(monitor.tripped)
+        if not browser.is_connected() or page.is_closed():
+            raise RuntimeError("Chromium exited while downloading pages.")
+        if last:
+            return "done"
+        if n >= MAX_PAGES:
+            job_log(job_dir, f"Reached the safety cap of {MAX_PAGES} pages.", "WARNING")
+            return "done"
+        reason = recycle_reason(snap, baseline, session_pages)
+        if reason:
+            job_log(job_dir, f"RECYCLE requested after page {n}: {reason}. The browser will be restarted and "
+                             f"resume at page {n + 1}.", "WARNING")
+            return "recycle"
 
 
 # =====================================================================
@@ -2115,21 +2496,23 @@ def compile_files(files, out_path: Path, job_dir: Path, rep: StepReporter) -> in
 
 
 # =====================================================================
-#  One browser SESSION: login once, then one fresh cycle per page
+#  One browser SESSION: login -> CLOSED ALARM tab -> page cycles (dates -> 500 -> page N -> download)
 # =====================================================================
 def run_session(job_dir: Path, dl_dir: Path, pages_dir: Path, rep: StepReporter, monitor: DiagnosticsMonitor,
-                state: dict, creds: dict) -> str:
-    """Returns 'done' (last page reached) or 'recycle' (memory pressure: state['next_page'] is the next page)."""
+                state: dict, username: str, password: str, start_d: date, end_d: date) -> str:
+    first = state["session_no"] == 1
+    resume_page = state["resume_page"]
+
     shutil.rmtree(dl_dir, ignore_errors=True)   # Playwright's temp download folder (page files live in pages_dir)
     dl_dir.mkdir(parents=True, exist_ok=True)
     monitor.reset()
     monitor.phase = "starting"
 
-    job_log(job_dir, f"=== BROWSER SESSION {state['session_no']} starting (next page: {state['next_page']}) | "
+    job_log(job_dir, f"=== BROWSER SESSION {state['session_no']} starting (resume at page {resume_page}) | "
                      f"{format_snapshot(collect_snapshot(dl_dir))}")
-    rep.running("Starting browser..." if state["session_no"] == 1 else
-                f"Restarting the browser (session {state['session_no']}), continuing at page {state['next_page']}...",
-                0.03)
+    rep.running("Starting browser..." if first else
+                f"Restarting the browser (session {state['session_no']}), resuming at page {resume_page}...",
+                0.05 if first else 0.46)
 
     with sync_playwright() as pw:
         browser = launch_browser(pw, job_dir, dl_dir)
@@ -2149,48 +2532,30 @@ def run_session(job_dir: Path, dl_dir: Path, pages_dir: Path, rep: StepReporter,
             attach_diagnostics(job_dir, browser, page)
 
             monitor.phase = "login"
-            rep.running("Logging in...", 0.04, quiet=state["session_no"] > 1)
-            pw_login(page, creds["username"], creds["password"])
+            rep.running("Logging in...", 0.10, quiet=not first)
+            pw_login(page, username, password)
 
-            session_pages = 0
-            baseline = None
-            while True:
-                page_no = state["next_page"]
-                is_last = False
-                for attempt in range(1, PAGE_ATTEMPTS + 1):
-                    try:
-                        is_last = fetch_page(page, job_dir, pages_dir, dl_dir, rep, monitor, browser,
-                                             state, creds, page_no)
-                        break
-                    except Exception as exc:
-                        if monitor.tripped or not browser.is_connected() or page.is_closed():
-                            raise
-                        job_log(job_dir, f"Page {page_no} cycle failed (attempt {attempt}/{PAGE_ATTEMPTS}): "
-                                         f"{str(exc)[:250]}", "WARNING")
-                        take_shot(page, job_dir, f"shot_p{page_no}_attempt{attempt}_failed")
-                        if attempt == PAGE_ATTEMPTS:
-                            raise
-                        time.sleep(3)
+            monitor.phase = "alarm-page"
+            rep.running("Opening alarm page...", 0.15, quiet=not first)
+            pw_open_alarm_page(page)
+            pw_scroll_to_alarm_section(page)
 
-                state["next_page"] = page_no + 1
-                session_pages += 1
-                snap = collect_snapshot(dl_dir)
-                job_log(job_dir, f"P{page_no} DONE            | {format_snapshot(snap)}")
-                if baseline is None:
-                    baseline = snap["chrom_rss"]
+            rep.running("Opening CLOSED ALARM tab...", 0.20, quiet=not first)
+            pw_click_closed_alarm_tab(page, job_dir)
+            if first:
+                take_shot(page, job_dir, "shot_0_closed_alarm_tab")
 
-                if is_last:
-                    return "done"
-                if monitor.tripped:
-                    raise RuntimeError(monitor.tripped)
-                if not browser.is_connected() or page.is_closed():
-                    raise RuntimeError("Chromium exited while downloading pages.")
+            monitor.phase = "footer-wait"
+            rep.running("Waiting for the table footer (pagination) to render...", 0.24, quiet=not first)
+            wait_footer_ready(page, job_dir, timeout=60)
 
-                reason = recycle_reason(snap, baseline, session_pages)
-                if reason:
-                    job_log(job_dir, f"RECYCLE requested after page {page_no}: {reason}. "
-                                     f"The browser will be restarted and continue at page {page_no + 1}.", "WARNING")
-                    return "recycle"
+            monitor.phase = "download-pages"
+            rep.running("Starting the page cycles (dates → Apply → 500 rows → page → download)...",
+                        0.30 if first else 0.46)
+            outcome = download_loop(page, job_dir, dl_dir, pages_dir, rep, monitor, browser, state, start_d, end_d)
+            if outcome == "done" and first:
+                take_shot(page, job_dir, "shot_4_last_page")
+            return outcome
         except Exception:
             job_log(job_dir, "State at failure: " + format_snapshot(collect_snapshot(dl_dir)), "ERROR")
             if page is not None:
@@ -2201,6 +2566,7 @@ def run_session(job_dir: Path, dl_dir: Path, pages_dir: Path, rep: StepReporter,
             raise
         finally:
             monitor.phase = "closing"
+            SITE_INFO["quiet"] = False
             for closer in (context, browser):
                 try:
                     if closer is not None:
@@ -2223,8 +2589,8 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
         for old in job_dir.glob(pattern):
             old.unlink(missing_ok=True)
 
-    creds = {"username": username, "password": password, "start": start_d, "end": end_d}
-    state = {"files": [], "hashes": {}, "next_page": 1, "total_pages": 1, "page_size": 0, "session_no": 0}
+    state = {"files": [], "hashes": {}, "resume_page": 1, "total_pages": 1, "session_no": 0, "page_size": None,
+             "date_strategy": None}
     monitor = None
     try:
         log_system_info(job_dir)
@@ -2235,18 +2601,21 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
         recycles = crash_restarts = 0
         while True:
             state["session_no"] += 1
-            next_before = state["next_page"]
+            resume_before = state["resume_page"]
             try:
-                outcome = run_session(job_dir, dl_dir, pages_dir, rep, monitor, state, creds)
+                outcome = run_session(job_dir, dl_dir, pages_dir, rep, monitor, state, username, password,
+                                      start_d, end_d)
+            except FatalJobError:
+                raise
             except Exception as exc:
                 reason = monitor.tripped or (str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__)
-                progressed = state["next_page"] > next_before
+                progressed = state["resume_page"] > resume_before
                 if progressed and crash_restarts < MAX_CRASH_RESTARTS:
                     crash_restarts += 1
                     job_log(job_dir, f"Session {state['session_no']} failed after progress "
-                                     f"(pages saved up to {state['next_page'] - 1}): {reason[:250]} -> "
-                                     f"restart {crash_restarts}/{MAX_CRASH_RESTARTS}, continuing at page "
-                                     f"{state['next_page']}.", "ERROR")
+                                     f"(pages saved up to {state['resume_page'] - 1}): {reason[:250]} -> "
+                                     f"restart {crash_restarts}/{MAX_CRASH_RESTARTS}, resuming at page "
+                                     f"{state['resume_page']}.", "ERROR")
                     kill_browser_processes(job_dir)
                     time.sleep(2)
                     continue
@@ -2257,10 +2626,10 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
                 recycles += 1
                 if recycles > MAX_RECYCLES:
                     raise RuntimeError(f"Browser was recycled {MAX_RECYCLES} times; stopping at page "
-                                       f"{state['next_page']}.")
+                                       f"{state['resume_page']}.")
                 monitor.phase = "recycling"
                 job_log(job_dir, f"Browser recycle {recycles}/{MAX_RECYCLES} done; next page "
-                                 f"{state['next_page']}. Memory after close: "
+                                 f"{state['resume_page']}. Memory after close: "
                                  f"{format_snapshot(collect_snapshot(dl_dir))}")
                 time.sleep(2)
                 continue
@@ -2347,8 +2716,7 @@ def read_log_tail(log_file: Path, n: int):
         with open(log_file, "rb") as fh:
             fh.seek(max(0, size - 64 * 1024))
             data = fh.read().decode("utf-8", errors="replace")
-        lines = data.splitlines()
-        return lines[-n:]
+        return data.splitlines()[-n:]
     except OSError:
         return []
 
@@ -2367,10 +2735,10 @@ def render_workflow(job_dir: Path, job_id: str):
 
     # ------------------------------------------------------------ STEP 1
     st.subheader("Step 1 · Retrieve closed alarms")
-    st.caption("For every page: reloads the alarm page, opens CLOSED ALARM, fills Start/End Date and clicks Apply, "
-               "sets 500 items per page, goes to that page, clicks Download Alarm › By Page, and repeats until the "
-               "last page. All files are then compiled into one Excel. The browser is restarted automatically "
-               "when memory grows.")
+    st.caption("Logs in and opens CLOSED ALARM. For EVERY page it fills Start/End Date, clicks Apply, sets 500 items "
+               "per page, goes to that page and clicks Download Alarm › By Page. The dates inside the table and "
+               "inside every downloaded file are checked against your range. All files are compiled into one "
+               "Excel. The browser is restarted automatically when memory grows.")
     show_status(s1)
     if s1["state"] == "error" and (job_dir / "error.png").exists():
         st.image(str(job_dir / "error.png"), caption="Browser screenshot when the error happened")
