@@ -3,19 +3,15 @@ PMT Alarm – Closed Alarm downloader (Playwright edition) – PER-PAGE CYCLE ED
 
 The site resets "Items per page" when the table moves to another page, so the page size can NOT be set once.
 NEW FLOW, repeated for EVERY page N:
-  1. DATA FIRST : pick the Start Date IN THE CALENDAR (the boxes cannot be typed into; the site fills End Date
-                  with today), click Apply and VERIFY THE FILTER: the row dates must fall in the chosen range
-  2. ROW SIZE   : set Items per page to 500 (the table shows 500 rows); the filter is verified again,
-                  because changing the page size may reload the table without the dates
+  1. DATA FIRST : make sure Start/End Date hold the wanted dates, click Apply
+  2. ROW SIZE   : set Items per page to 500 (the table shows 500 rows)
   3. NAVIGATE   : for N > 1 click page N (page-number button, or Next until it is reached);
                   if the size resets to 10 on the way, 500 is selected again; the footer range
                   ("501-1000 of ...") is used to VERIFY that the table really shows page N
-  4. DOWNLOAD   : Download Alarm > By Page (one file per page); the dates inside the downloaded file are
-                  checked too (the first files stop the job immediately if they contain tickets from outside
-                  the range, e.g. 2021, instead of downloading 250+ useless pages)
+  4. DOWNLOAD   : Download Alarm > By Page (one file per page)
   then go back to step 1 for page N+1, until the last page.
 All page files are compiled into ONE Excel file.
-UI      One section: status, form, and (when the job is done) the compiled XLSX offered for download (no processing)
+STEP 3  Download -> hand the compiled XLSX to the browser (no processing)
 
 MEMORY MANAGEMENT (kept from the previous version)
   * Guard measures the container WORKING SET (memory.current - inactive_file), 93 %, 3 samples in a row,
@@ -100,13 +96,7 @@ MAX_PAGES = 3000              # safety cap for the pagination loop
 DOWNLOAD_TIMEOUT = 240        # seconds to wait for ONE "By Page" file
 PAGE_SIZE_LOAD_TIMEOUT = 240  # seconds to wait for the table to grow after choosing a bigger page size
 PAGE_SIZE_STABLE_SECONDS = 6  # a partial table (fewer rows than chosen size) must stay unchanged this long
-APPLY_LOAD_TIMEOUT = 60       # seconds to wait for the table to reload after the FIRST Apply of a session
-APPLY_RETRY_TIMEOUT = 30      # seconds to wait after an Apply that is repeated because the filter was not active
-
-# ---- date filter verification ---------------------------------------------
-VERIFY_FILTER = True          # check the dates inside the table rows AND inside every downloaded file
-FILTER_TOLERANCE_DAYS = 1     # a row date may be this many days outside the range (time zones / end of day)
-FATAL_FILE_PAGES = 2          # a downloaded file outside the range on pages <= this stops the whole job
+APPLY_LOAD_TIMEOUT = 90       # seconds to wait for the table to reload after the FIRST Apply of a session
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 # =========================================================
@@ -119,10 +109,6 @@ log = logging.getLogger("pmt_alarm")
 faulthandler.enable()
 
 _INSTALL_LOCK = threading.Lock()
-
-
-class FatalJobError(RuntimeError):
-    """An error that must stop the job at once (no page-cycle retry, no browser restart)."""
 
 
 # =====================================================================
@@ -743,7 +729,7 @@ MARK_CONTROL_JS = "(kind) => {" + _FIND_TABLE + r"""
     target = inputs[0];
   } else if (kind === 'apply') {
     const btns = Array.from(document.querySelectorAll('button, [role="button"]'))
-      .filter(el => vis(el) && before(el) && /^APPLY( FILTERS?)?$/.test((el.innerText || '').replace(/\s+/g, ' ').trim().toUpperCase()));
+      .filter(el => vis(el) && before(el) && (el.innerText || '').replace(/\s+/g, ' ').trim().toUpperCase() === 'APPLY');
     target = btns[btns.length - 1];
   } else if (kind === 'items') {
     const labels = all.filter(el => vis(el) && after(el) && own(el) === 'items');
@@ -772,339 +758,8 @@ def mark_control(page, kind: str, timeout=DEFAULT_TIMEOUT):
     raise RuntimeError(f"Could not find the '{kind}' control next to the Closed Alarm table (result: {res}).")
 
 
-# =====================================================================
-#  CALENDAR date picker: the Start/End Date boxes cannot be typed into, the date must be CLICKED in the calendar.
-#  The site fills End Date with the current day by itself once Start Date is chosen.
-#  The calendar's HTML is unknown, so the picker is detected generically: the smallest element that contains
-#  at least 28 different day numbers (1..31) and the month buttons; its header ("Oktober 2026") is parsed,
-#  the previous / next month buttons are clicked until the right month shows, then the day cell is clicked.
-# =====================================================================
-CAL_COMMON_JS = _FIND_TABLE + r"""
-  const vis = el => (el.offsetParent !== null || el.getClientRects().length > 0) && el.getBoundingClientRect().width > 0;
-  const own = el => Array.from(el.childNodes).filter(n => n.nodeType === 3)
-                         .map(n => n.textContent).join('').replace(/\s+/g, ' ').trim();
-  const clsOf = e => (e && e.getAttribute && e.getAttribute('class')) || '';
-  const meta = e => {
-    let s = (e.getAttribute('aria-label') || '') + ' ' + (e.getAttribute('title') || '') + ' ' + clsOf(e) + ' ' +
-            (e.getAttribute('data-testid') || '') + ' ' + (e.innerText || '');
-    Array.from(e.querySelectorAll('*')).slice(0, 4).forEach(c => {
-      s += ' ' + clsOf(c) + ' ' + (c.getAttribute('data-testid') || '') + ' ' + (c.getAttribute('aria-label') || '');
-    });
-    return s.toLowerCase();
-  };
-  const PREV = /prev|chevron[_-]?left|arrow[_-]?back|arrow[_-]?left|navigate[_-]?before|angle-left|caret-left|‹|«|(^|[^a-z])left([^a-z]|$)/;
-  const NEXT = /next|chevron[_-]?right|arrow[_-]?forward|arrow[_-]?right|navigate[_-]?next|angle-right|caret-right|›|»|(^|[^a-z])right([^a-z]|$)/;
-  const isDis = b => !!(b.disabled || b.getAttribute('aria-disabled') === 'true' || /disabled/.test(clsOf(b).toLowerCase()));
-  const navBtn = (root, dir) => {
-    const rx = dir === 'prev' ? PREV : NEXT;
-    const notDay = el => !/^\d{1,2}$/.test((el.innerText || '').trim());
-    let c = Array.from(root.querySelectorAll('button, [role="button"], a')).filter(el => vis(el) && notDay(el));
-    let hit = c.filter(el => rx.test(meta(el)));
-    if (!hit.length) {
-      c = Array.from(root.querySelectorAll('i, svg, span')).filter(el => vis(el) && el.children.length <= 1 && notDay(el));
-      hit = c.filter(el => rx.test(meta(el)));
-    }
-    const noYear = hit.filter(el => !/year|decade/.test(meta(el)));
-    if (noYear.length) hit = noYear;
-    return hit[0] || null;
-  };
-"""
-
-CAL_FIND_JS = "() => {" + CAL_COMMON_JS + r"""
-  document.querySelectorAll('[data-pw-cal]').forEach(e => e.removeAttribute('data-pw-cal'));
-  const table = findTable();
-  const leaves = Array.from(document.querySelectorAll('body *')).filter(e => {
-    const t = own(e);
-    if (!/^\d{1,2}$/.test(t)) return false;
-    const n = parseInt(t, 10);
-    if (n < 1 || n > 31) return false;
-    if (table && table.contains(e)) return false;
-    return vis(e);
-  });
-  if (leaves.length < 28) return {found: false, leaves: leaves.length};
-  const sets = new Map();
-  leaves.forEach(l => {
-    const n = parseInt(own(l), 10);
-    let p = l, d = 0;
-    while (p && p !== document.body && d < 12) {
-      let s = sets.get(p);
-      if (!s) { s = new Set(); sets.set(p, s); }
-      s.add(n);
-      p = p.parentElement; d++;
-    }
-  });
-  let best = null, bestSize = Infinity;
-  sets.forEach((s, el) => {
-    if (s.size >= 28 && s.has(1) && s.has(28)) {
-      const sz = el.getElementsByTagName('*').length;
-      if (sz < bestSize) { best = el; bestSize = sz; }
-    }
-  });
-  if (!best) return {found: false, leaves: leaves.length};
-  let root = best, p = best;
-  for (let i = 0; i < 8 && p && p !== document.body; i++) {
-    if (navBtn(p, 'prev') && navBtn(p, 'next')) { root = p; break; }
-    p = p.parentElement;
-  }
-  root.setAttribute('data-pw-cal', '1');
-  return {found: true, leaves: leaves.length, tag: root.tagName.toLowerCase(), cls: clsOf(root).slice(0, 100),
-          text: (root.innerText || '').replace(/\s+/g, ' ').slice(0, 160), html: root.outerHTML.slice(0, 1500)};
-}"""
-
-CAL_TEXT_JS = """() => {
-  const r = document.querySelector('[data-pw-cal]');
-  return r ? (r.innerText || '') : '';
-}"""
-
-CAL_NAV_JS = "(dir) => {" + CAL_COMMON_JS + r"""
-  document.querySelectorAll('[data-pw-nav]').forEach(e => e.removeAttribute('data-pw-nav'));
-  const root = document.querySelector('[data-pw-cal]');
-  if (!root) return {ok: false, why: 'no-calendar'};
-  const b = navBtn(root, dir);
-  if (!b) return {ok: false, why: 'no-' + dir + '-button'};
-  b.setAttribute('data-pw-nav', '1');
-  return {ok: true, disabled: isDis(b), meta: meta(b).replace(/\s+/g, ' ').slice(0, 80)};
-}"""
-
-CAL_DAY_JS = "(day) => {" + CAL_COMMON_JS + r"""
-  document.querySelectorAll('[data-pw-day]').forEach(e => e.removeAttribute('data-pw-day'));
-  const root = document.querySelector('[data-pw-cal]');
-  if (!root) return {ok: false, why: 'no-calendar'};
-  const BAD = /outside|other-?month|prev-?month|next-?month|adjacent|disabled|muted|not-?current|out-of-month/;
-  const cell = e => e.closest('button, [role="gridcell"], [role="button"], td, li') || e;
-  const isBad = c => {
-    let n = c;
-    for (let i = 0; i < 3 && n && n !== root; i++) {
-      if (BAD.test(clsOf(n).toLowerCase()) || n.disabled || n.getAttribute('aria-disabled') === 'true' ||
-          n.getAttribute('aria-hidden') === 'true') return true;
-      n = n.parentElement;
-    }
-    return false;
-  };
-  const list = [], seen = new Set();
-  Array.from(root.querySelectorAll('*')).forEach(e => {
-    if (!vis(e) || !/^\d{1,2}$/.test(own(e)) || parseInt(own(e), 10) !== day) return;
-    const c = cell(e);
-    if (seen.has(c)) return;
-    seen.add(c);
-    list.push({c: c, bad: isBad(c)});
-  });
-  let good = list.filter(x => !x.bad);
-  if (!good.length) good = list;
-  if (!good.length) return {ok: false, why: 'day-not-found', count: 0};
-  // days of the neighbouring months: late days of the previous month come first, early days of the next month last
-  const pick = good.length === 1 ? good[0] : (day >= 15 ? good[good.length - 1] : good[0]);
-  pick.c.setAttribute('data-pw-day', '1');
-  return {ok: true, count: list.length, good: good.length, cls: clsOf(pick.c).slice(0, 80)};
-}"""
-
-CAL_OK_JS = "() => {" + CAL_COMMON_JS + r"""
-  document.querySelectorAll('[data-pw-ok]').forEach(e => e.removeAttribute('data-pw-ok'));
-  const root = document.querySelector('[data-pw-cal]');
-  if (!root) return false;
-  const scope = root.closest('[role="dialog"], .MuiPopper-root, .mat-datepicker-content, .MuiDialog-root') || root;
-  const btn = Array.from(scope.querySelectorAll('button, [role="button"]')).find(b => vis(b) &&
-      /^(ok|apply|set|done|select|choose|confirm|simpan|pilih|terapkan)$/i.test((b.innerText || '').trim()));
-  if (!btn) return false;
-  btn.setAttribute('data-pw-ok', '1');
-  return true;
-}"""
-
-CAL_ICON_JS = "() => {" + CAL_COMMON_JS + r"""
-  document.querySelectorAll('[data-pw-icon]').forEach(e => e.removeAttribute('data-pw-icon'));
-  const inp = document.querySelector('[data-pw-target]');
-  if (!inp) return false;
-  const r0 = inp.getBoundingClientRect();
-  let p = inp.parentElement;
-  for (let i = 0; i < 4 && p; i++) {
-    const c = Array.from(p.querySelectorAll('button, [role="button"], svg, i, [class*="icon" i], [class*="calendar" i], ' +
-                                            '[aria-label*="calendar" i], [aria-label*="date" i]'))
-      .filter(e => e !== inp && !e.contains(inp) && vis(e))
-      .filter(e => {
-        const r = e.getBoundingClientRect();
-        return Math.abs((r.top + r.bottom) / 2 - (r0.top + r0.bottom) / 2) < 30 && r.width < 80;
-      });
-    if (c.length) { c[0].setAttribute('data-pw-icon', '1'); return true; }
-    p = p.parentElement;
-  }
-  return false;
-}"""
-
-CAL_DIAG_JS = "() => {" + CAL_COMMON_JS + r"""
-  const out = [];
-  document.querySelectorAll("[class*='calendar' i], [class*='datepicker' i], [class*='date-picker' i], " +
-                            "[class*='picker' i], [class*='popper' i], [class*='popover' i], [role='dialog'], [role='grid']")
-    .forEach(e => {
-      if (!vis(e)) return;
-      out.push({tag: e.tagName.toLowerCase(), cls: clsOf(e).slice(0, 120), html: e.outerHTML.slice(0, 1800)});
-    });
-  return out.slice(0, 6);
-}"""
-
-MAX_CAL_STEPS = 150          # month clicks allowed to reach the wanted month (about 12 years)
-
-_CAL_MON = (r"januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|november|desember|january|february|"
-            r"march|may|june|july|august|october|december|jan|feb|mar|apr|jun|jul|aug|agu|agt|ags|sept|sep|oct|okt|nov|"
-            r"dec|des")
-_CAL_RE1 = re.compile(rf"(?<![a-z])({_CAL_MON})[a-z]*\.?,?\s*(\d{{4}})", re.I)      # October 2026 / Okt 2026
-_CAL_RE2 = re.compile(rf"(\d{{4}})\s*,?\s*({_CAL_MON})(?![a-z])", re.I)             # 2026 October
-
-
-def parse_cal_header(text: str):
-    """(year, month) shown in the calendar header, or None."""
-    m = _CAL_RE1.search(text or "")
-    if m:
-        mon = _MONTHS.get(m.group(1)[:3].lower())
-        if mon:
-            return int(m.group(2)), mon
-    m = _CAL_RE2.search(text or "")
-    if m:
-        mon = _MONTHS.get(m.group(2)[:3].lower())
-        if mon:
-            return int(m.group(1)), mon
-    return None
-
-
-def calendar_diagnostics(page, job_dir: Path, tag: str):
-    """Screenshot + HTML of everything that looks like a calendar (for fixing the picker if it fails)."""
-    take_shot(page, job_dir, f"shot_calendar_{tag}")
-    try:
-        items = page.evaluate(CAL_DIAG_JS)
-    except PWError as exc:
-        job_log(job_dir, f"CALENDAR DIAG failed: {str(exc)[:120]}", "WARNING")
-        return
-    job_log(job_dir, f"CALENDAR DIAG [{tag}]: {len(items)} calendar-like visible element(s)", "WARNING")
-    for it in items:
-        job_log(job_dir, f"  <{it['tag']} class='{it['cls']}'> {it['html'][:300]}", "WARNING")
-        append_dom(job_dir, "calendar_", f"[{tag}] <{it['tag']} class='{it['cls']}'>\n{it['html']}\n")
-
-
-def open_calendar(page, job_dir: Path, kind: str):
-    """Open the calendar of the Start/End Date box (click the box, then the calendar icon). Returns info or None."""
-    for how in ("input", "icon"):
-        try:
-            box = mark_control(page, kind, 15)
-            box.scroll_into_view_if_needed()
-            if how == "input":
-                safe_click(box)
-            else:
-                if not page.evaluate(CAL_ICON_JS):
-                    continue
-                safe_click(page.locator("[data-pw-icon]").first)
-        except (PWError, RuntimeError) as exc:
-            job_log(job_dir, f"[calendar] opening via {how} failed: {str(exc)[:120]}", "WARNING")
-            continue
-        end = time.time() + 3.5
-        while time.time() < end:
-            info = page.evaluate(CAL_FIND_JS)
-            if info.get("found"):
-                return info
-            page.wait_for_timeout(300)
-        job_log(job_dir, f"[calendar] no calendar after clicking the {how}.", "WARNING")
-        try:
-            page.keyboard.press("Escape")
-        except PWError:
-            pass
-        page.wait_for_timeout(300)
-    return None
-
-
-def calendar_goto_month(page, job_dir: Path, target: date):
-    """Click previous/next month until the header shows the target month."""
-    for step in range(MAX_CAL_STEPS + 1):
-        txt = page.evaluate(CAL_TEXT_JS)
-        if not txt:                                   # the root element was re-rendered: find it again
-            page.evaluate(CAL_FIND_JS)
-            txt = page.evaluate(CAL_TEXT_JS)
-        cur = parse_cal_header(txt)
-        if cur is None:
-            raise RuntimeError(f"cannot read the month in the calendar header: {txt[:80]!r}")
-        diff = (target.year * 12 + target.month) - (cur[0] * 12 + cur[1])
-        if diff == 0:
-            if step:
-                job_log(job_dir, f"[calendar] reached {target:%B %Y} after {step} click(s).")
-            return
-        direction = "next" if diff > 0 else "prev"
-        res = page.evaluate(CAL_NAV_JS, direction)
-        if not res.get("ok"):
-            raise RuntimeError(f"no '{direction}' month button in the calendar ({res.get('why')})")
-        if res.get("disabled"):
-            raise RuntimeError(f"the '{direction}' month button is disabled at {cur[1]:02d}/{cur[0]} "
-                               f"(the date is outside what the calendar allows)")
-        safe_click(page.locator("[data-pw-nav]").first)
-        page.wait_for_timeout(250)
-    raise RuntimeError(f"could not reach {target:%B %Y} within {MAX_CAL_STEPS} clicks")
-
-
-def pick_date_via_calendar(page, job_dir: Path, kind: str, value: date, close: bool = True):
-    """Choose `value` in the calendar of the Start/End Date box and verify the box shows it."""
-    label = "Start Date" if kind == "start" else "End Date"
-    want = re.sub(r"\D", "", value.strftime(DATE_INPUT_FORMAT))
-    last_error = ""
-    for attempt in (1, 2):
-        try:
-            info = open_calendar(page, job_dir, kind)
-            if not info:
-                raise RuntimeError("the calendar did not open")
-            if attempt == 1 and not page_state_flag("cal_logged"):
-                job_log(job_dir, f"[calendar] detected <{info['tag']} class='{info['cls']}'> text={info['text']!r}")
-            calendar_goto_month(page, job_dir, value)
-            res = page.evaluate(CAL_DAY_JS, value.day)
-            if not res.get("ok"):
-                raise RuntimeError(f"day {value.day} not found in the calendar ({res.get('why')})")
-            safe_click(page.locator("[data-pw-day]").first)
-            got, end = "", time.time() + 3
-            while time.time() < end:
-                page.wait_for_timeout(300)
-                got = _box_digits(page, kind)
-                if got == want:
-                    break
-            if got != want and page.evaluate(CAL_OK_JS):
-                safe_click(page.locator("[data-pw-ok]").first)
-                page.wait_for_timeout(500)
-                got = _box_digits(page, kind)
-            if got == want:
-                job_log(job_dir, f"[{label}] picked {value:%d-%m-%Y} in the calendar (box digits {got}).")
-                if close and page.evaluate(CAL_FIND_JS).get("found"):
-                    try:
-                        page.keyboard.press("Escape")
-                    except PWError:
-                        pass
-                    page.wait_for_timeout(400)
-                    if _box_digits(page, kind) != want:          # Escape reverted the choice: pick it again, keep open
-                        job_log(job_dir, f"[{label}] Escape reverted the date; choosing it again.", "WARNING")
-                        return pick_date_via_calendar(page, job_dir, kind, value, close=False)
-                return
-            raise RuntimeError(f"after clicking day {value.day} the box shows '{got}' instead of '{want}'")
-        except (PWError, RuntimeError) as exc:
-            last_error = str(exc)[:200]
-            job_log(job_dir, f"[{label}] calendar attempt {attempt}/2 failed: {last_error}", "WARNING")
-            calendar_diagnostics(page, job_dir, f"{kind}{attempt}")
-            try:
-                page.keyboard.press("Escape")
-            except PWError:
-                pass
-            page.wait_for_timeout(500)
-    raise RuntimeError(f"Could not pick {label} {value:%d-%m-%Y} in the calendar: {last_error}")
-
-
-_FLAGS = {}
-
-
-def page_state_flag(name: str) -> bool:
-    """True after the first call with this name (used to log the detected calendar only once)."""
-    if _FLAGS.get(name):
-        return True
-    _FLAGS[name] = True
-    return False
-
-
-DATE_STRATEGIES = ("calendar", "calendar_force", "tab")
-_DATE_MODES = {"tab": ("typed", "digits")}     # last resort: type into the box (the site normally blocks this)
-
-
-def pw_set_date(page, job_dir: Path, label: str, value: date, strategy: str = "tab"):
-    """Put a date into the Closed Alarm 'Start Date' / 'End Date' box and verify what the box holds."""
+def pw_set_date(page, job_dir: Path, label: str, value: date):
+    """Type a date into the Closed Alarm 'Start Date' / 'End Date' box and verify what the page holds."""
     text = value.strftime(DATE_INPUT_FORMAT)
     want = re.sub(r"\D", "", text)
     kind = "start" if label.lower().startswith("start") else "end"
@@ -1112,21 +767,16 @@ def pw_set_date(page, job_dir: Path, label: str, value: date, strategy: str = "t
     inp.wait_for(state="visible", timeout=DEFAULT_TIMEOUT * 1000)
     inp.scroll_into_view_if_needed()
     last = ""
-    for mode in _DATE_MODES.get(strategy, _DATE_MODES["tab"]):
+    for mode in ("typed", "digits", "js"):
         try:
             inp = mark_control(page, kind, 10)
-            if mode.startswith("js"):
-                inp.click()
+            if mode == "js":
                 inp.evaluate(JS_SET_VALUE, text)
             else:
                 inp.click()
                 inp.press("Control+A")
                 inp.press("Backspace")
-                inp.press_sequentially(text if mode.startswith("typed") else want, delay=50)
-            if mode.endswith("+enter"):
-                inp.press("Enter")
-                page.wait_for_timeout(300)
-                inp = mark_control(page, kind, 10)
+                inp.press_sequentially(text if mode == "typed" else want, delay=50)
             inp.press("Tab")
             page.wait_for_timeout(400)
             last = mark_control(page, kind, 10).input_value()
@@ -1134,53 +784,23 @@ def pw_set_date(page, job_dir: Path, label: str, value: date, strategy: str = "t
             job_log(job_dir, f"[{label}] mode={mode} error: {str(exc)[:120]}", "WARNING")
             continue
         if re.sub(r"\D", "", last) == want:
-            job_log(job_dir, f"[{label}] (Closed Alarm filter) set to '{last}' (strategy={strategy}, mode={mode})")
+            job_log(job_dir, f"[{label}] (Closed Alarm filter) set to '{last}' (mode={mode})")
             return
         job_log(job_dir, f"[{label}] mode={mode} left '{last}' instead of '{text}'", "WARNING")
     raise RuntimeError(f"Could not set {label} to {text} (the box shows '{last}').")
 
 
-def _box_digits(page, kind: str) -> str:
-    try:
-        return re.sub(r"\D", "", mark_control(page, kind, 10).input_value())
-    except (PWError, RuntimeError):
-        return ""
-
-
-def set_dates(page, job_dir: Path, start_d: date, end_d: date, strategy: str, force: bool):
-    """
-    calendar / calendar_force: CLICK the Start Date in the calendar (the site then fills End Date with today).
-    calendar skips the pick when the box already shows the date, calendar_force always picks it.
-    tab: type into the boxes (last resort). force=False skips a box that already shows the wanted date.
-    """
-    want_s = re.sub(r"\D", "", start_d.strftime(DATE_INPUT_FORMAT))
-    want_e = re.sub(r"\D", "", end_d.strftime(DATE_INPUT_FORMAT))
-    if strategy.startswith("calendar"):
-        if strategy == "calendar_force" or _box_digits(page, "start") != want_s:
-            pick_date_via_calendar(page, job_dir, "start", start_d)
-            page.wait_for_timeout(800)                     # the site fills End Date with the current day
-        got_e = _box_digits(page, "end")
-        if got_e != want_e:
-            job_log(job_dir, f"End Date shows {got_e}, wanted {want_e}: choosing it in the calendar.")
-            try:
-                pick_date_via_calendar(page, job_dir, "end", end_d)
-            except RuntimeError as exc:
-                job_log(job_dir, f"Could not choose End Date ({str(exc)[:160]}); the box keeps {got_e}. "
-                                 f"Continuing with the date the site filled in.", "WARNING")
-        if _box_digits(page, "start") != want_s:
-            job_log(job_dir, f"Start Date no longer shows {want_s} after the End Date step.", "WARNING")
-        return
-    items = (("Start Date", start_d, "start"), ("End Date", end_d, "end"))
-    for label, value, kind in items:
+def ensure_dates(page, job_dir: Path, start_d: date, end_d: date):
+    """Make sure both date boxes hold the wanted dates (typing them only when they differ)."""
+    for label, value, kind in (("Start Date", start_d, "start"), ("End Date", end_d, "end")):
         want = re.sub(r"\D", "", value.strftime(DATE_INPUT_FORMAT))
-        if not force and _box_digits(page, kind) == want:
+        try:
+            cur = mark_control(page, kind, 10).input_value()
+        except (PWError, RuntimeError):
+            cur = ""
+        if re.sub(r"\D", "", cur) == want:
             continue
-        pw_set_date(page, job_dir, label, value, strategy)
-    for label, value, kind in items:          # typing the 2nd date may have reset the 1st one: re-check both
-        want = re.sub(r"\D", "", value.strftime(DATE_INPUT_FORMAT))
-        if _box_digits(page, kind) != want:
-            job_log(job_dir, f"[{label}] changed while typing the other date; typing it again.", "WARNING")
-            pw_set_date(page, job_dir, label, value, strategy)
+        pw_set_date(page, job_dir, label, value)
 
 
 def pw_click_apply(page):
@@ -1202,23 +822,6 @@ COUNT_ROWS_JS = "() => {" + _FIND_TABLE + r"""
   if (!table) return -1;
   return Array.from(table.querySelectorAll('tbody tr'))
       .filter(tr => tr.querySelectorAll('td').length >= 3 && (tr.innerText || '').trim()).length;
-}"""
-
-# A handful of rows (first 3, last 3, 4 spread in the middle) with their cell texts: used to check the dates.
-SAMPLE_ROWS_JS = "() => {" + _FIND_TABLE + r"""
-  const t = findTable();
-  if (!t) return null;
-  const clean = x => (x || '').replace(/\s+/g, ' ').trim();
-  const heads = Array.from(t.querySelectorAll('thead th')).map(th => clean(th.innerText));
-  const trs = Array.from(t.querySelectorAll('tbody tr'))
-      .filter(tr => tr.querySelectorAll('td').length >= 3 && (tr.innerText || '').trim());
-  const n = trs.length;
-  const idx = new Set();
-  [0, 1, 2, n - 3, n - 2, n - 1].forEach(i => { if (i >= 0 && i < n) idx.add(i); });
-  for (let k = 1; k <= 4; k++) idx.add(Math.floor(n * k / 5));
-  const rows = Array.from(idx).filter(i => i >= 0 && i < n).sort((a, b) => a - b)
-      .map(i => Array.from(trs[i].querySelectorAll('td')).map(td => clean(td.innerText)));
-  return {heads: heads, rows: rows, n: n};
 }"""
 
 # Tiny signature of the table (row count + first row + last row). Computed INSIDE the browser,
@@ -1359,128 +962,6 @@ def wait_sig_change(page, old, timeout=40, poll_ms=700):
             continue
         page.wait_for_timeout(poll_ms)
     return False
-
-
-# ---------------------------------------------------------------------
-#  Date-filter verification: do the rows really belong to the chosen Start/End Date?
-# ---------------------------------------------------------------------
-_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "mei": 5, "jun": 6, "jul": 7, "aug": 8, "agu": 8,
-           "agt": 8, "ags": 8, "sep": 9, "oct": 10, "okt": 10, "nov": 11, "nop": 11, "dec": 12, "des": 12}
-_D1 = re.compile(r"(?<!\d)(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)")          # 2026-10-02
-_D2 = re.compile(r"(?<!\d)(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})(?!\d)")          # 02-10-2026 / 02/10/2026
-_D3 = re.compile(r"(?<!\d)(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})(?!\d)")    # 2 Oct 2026 / 2 Okt 2026
-
-
-def _mk_date(y, m, d):
-    try:
-        if 2000 <= y <= 2100:
-            return date(y, m, d)
-    except ValueError:
-        pass
-    return None
-
-
-def cell_dates(cell) -> list:
-    """All dates found in one cell (datetime/date objects or text in the usual formats)."""
-    if cell is None:
-        return []
-    if isinstance(cell, datetime):
-        return [cell.date()]
-    if isinstance(cell, date):
-        return [cell]
-    if not isinstance(cell, str):
-        return []
-    out = []
-    for y, m, d in _D1.findall(cell):
-        x = _mk_date(int(y), int(m), int(d))
-        if x:
-            out.append(x)
-    for a, b, y in _D2.findall(cell):
-        x = _mk_date(int(y), int(b), int(a)) or _mk_date(int(y), int(a), int(b))   # dd-mm first, then mm-dd
-        if x:
-            out.append(x)
-    for d, mon, y in _D3.findall(cell):
-        m = _MONTHS.get(mon[:3].lower())
-        x = _mk_date(int(y), m, int(d)) if m else None
-        if x:
-            out.append(x)
-    return out
-
-
-def judge_rows(rows, start_d: date, end_d: date):
-    """
-    Returns (ok, info). ok=True: the sampled rows carry dates inside the range. ok=False: most sampled rows have
-    NO date inside the range (unfiltered data, e.g. tickets from 2021). ok=None: no date-like cells at all.
-    """
-    lo = start_d - timedelta(days=FILTER_TOLERANCE_DAYS)
-    hi = end_d + timedelta(days=FILTER_TOLERANCE_DAYS)
-    checked = bad = 0
-    seen = []
-    for row in rows:
-        ds = []
-        for c in row:
-            ds.extend(cell_dates(c))
-        if not ds:
-            continue
-        checked += 1
-        seen.extend(ds)
-        if not any(lo <= d <= hi for d in ds):
-            bad += 1
-    if checked == 0:
-        return None, "no date-like cells in the sampled rows, the filter cannot be verified"
-    span = f"{min(seen):%d-%m-%Y}..{max(seen):%d-%m-%Y}"
-    if bad * 2 > checked:
-        return False, (f"{bad} of {checked} sampled rows have no date inside {start_d:%d-%m-%Y}..{end_d:%d-%m-%Y} "
-                       f"(dates seen: {span})")
-    return True, f"{checked - bad} of {checked} sampled rows are inside the range (dates seen: {span})"
-
-
-def verify_screen(page, job_dir: Path, start_d: date, end_d: date, log_sample=False):
-    """Check the rows currently shown in the Closed Alarm table. Returns (ok|None, info)."""
-    if not VERIFY_FILTER:
-        return True, "verification disabled"
-    try:
-        data = page.evaluate(SAMPLE_ROWS_JS)
-    except PWError as exc:
-        return None, f"could not read the table: {str(exc)[:100]}"
-    if not data or not data.get("rows"):
-        return None, "no rows to check"
-    if log_sample:
-        job_log(job_dir, f"FILTER SAMPLE headers={data.get('heads')}")
-        job_log(job_dir, f"FILTER SAMPLE first row={data['rows'][0]}")
-        job_log(job_dir, f"FILTER SAMPLE last row={data['rows'][-1]}")
-    return judge_rows(data["rows"], start_d, end_d)
-
-
-def verify_file(path: Path, start_d: date, end_d: date):
-    """Check the dates inside a downloaded XLSX page file. Returns (ok|None, info)."""
-    if not VERIFY_FILTER:
-        return True, "verification disabled"
-    if path.suffix.lower() != ".xlsx":
-        return None, f"{path.suffix} file, not checked"
-    try:
-        wb = load_workbook(path, read_only=True, data_only=True)
-    except Exception as exc:
-        return None, f"cannot open the file: {str(exc)[:100]}"
-    rows, header_seen = [], False
-    try:
-        for row in wb.worksheets[0].iter_rows(values_only=True):
-            vals = list(row)
-            if not header_seen:
-                if sum(1 for v in vals if v not in (None, "")) >= 3:
-                    header_seen = True
-                continue
-            if any(v not in (None, "") for v in vals):
-                rows.append(vals)
-    except Exception as exc:
-        return None, f"cannot read the file: {str(exc)[:100]}"
-    finally:
-        wb.close()
-    if not rows:
-        return None, "no data rows in the file"
-    n = len(rows)
-    idx = sorted({0, 1, 2, n - 3, n - 2, n - 1} | {n * k // 5 for k in range(1, 5)})
-    return judge_rows([rows[i] for i in idx if 0 <= i < n], start_d, end_d)
 
 
 # ---------------------------------------------------------------------
@@ -2308,92 +1789,14 @@ def quick_set_size(page, job_dir: Path, size: int, rep=None, base_progress=0.0) 
 # =====================================================================
 #  Apply filter, page navigation, page cycle
 # =====================================================================
-def apply_filters(page, job_dir: Path, timeout: float):
-    """Click Apply and wait (up to `timeout` s) for the table to reload."""
+def apply_filters(page, job_dir: Path, expect_change: bool):
+    """Click Apply and wait for the table to reload. `expect_change`: first Apply of a session (wait up to 90 s)."""
     old = get_sig(page)
     pw_click_apply(page)
-    changed = wait_sig_change(page, old, timeout)
+    changed = wait_sig_change(page, old, APPLY_LOAD_TIMEOUT if expect_change else APPLY_QUICK_TIMEOUT)
     wait_loading_done(page)
     page.wait_for_timeout(1000)
-    job_log(job_dir, f"Apply clicked: table changed={changed}, rows now {effective_rows(page)}")
-
-
-def ensure_size(page, job_dir: Path, state: dict, rep, prog: float) -> int:
-    """Make the table show the job's page size (500). The first call discovers the control with diagnostics."""
-    rows = effective_rows(page)
-    size = state["page_size"]
-    if size is None:
-        if rows > DEFAULT_PAGE_ROWS:
-            size = rows
-            job_log(job_dir, f"Page size already shows {rows} rows after Apply; using {rows} as the page size.")
-        else:
-            rows = pw_set_page_size(page, job_dir, rep=rep, strict=True, tag="2a_", base_progress=prog)
-            size = max(rows, 1)
-            if state["session_no"] == 1 and not state.get("shot_size"):
-                state["shot_size"] = True
-                take_shot(page, job_dir, "shot_1_after_page_size")
-        state["page_size"] = size
-        job_log(job_dir, f"PAGE SIZE for this job: {size} rows per page.")
-    elif size > DEFAULT_PAGE_ROWS and rows <= DEFAULT_PAGE_ROWS:
-        quick_set_size(page, job_dir, size, rep=rep, base_progress=prog)
-    return size
-
-
-def prepare_filtered_table(page, job_dir: Path, rep, state: dict, start_d: date, end_d: date,
-                           first_cycle: bool, prog: float) -> int:
-    """
-    DATA FIRST, THEN ROW SIZE, and prove that the date filter is really active:
-      dates -> Apply -> (rows == 0 ?) -> 500 rows -> check the row dates -> (lost? Apply again, 500 again) -> check
-    If the rows do not belong to the chosen range the next date-commit strategy is tried (Tab / Enter / JS events).
-    """
-    known = state["date_strategy"]
-    order = ([known] if known else []) + [x for x in DATE_STRATEGIES if x != known]
-    fails = []
-    for i, strat in enumerate(order, 1):
-        first_try = i == 1
-        force = first_cycle or not first_try
-        if first_cycle or not first_try:
-            job_log(job_dir, f"FILTER attempt {i}/{len(order)}: dates via [{strat}], force_typing={force}")
-        set_dates(page, job_dir, start_d, end_d, strat, force)
-        apply_filters(page, job_dir, APPLY_LOAD_TIMEOUT if (first_cycle and first_try)
-                      else APPLY_QUICK_TIMEOUT if first_try else APPLY_RETRY_TIMEOUT)
-
-        rows = effective_rows(page)
-        if rows == 0:
-            page.wait_for_timeout(3000)
-            rows = effective_rows(page)
-        if rows == 0:
-            raise FatalJobError(f"No closed alarms were found between {start_d:%d-%m-%Y} and {end_d:%d-%m-%Y}.")
-
-        size = ensure_size(page, job_dir, state, rep, prog)
-        ok, info = verify_screen(page, job_dir, start_d, end_d, log_sample=first_cycle)
-        if ok is False:
-            job_log(job_dir, f"FILTER CHECK failed after the page size step ({info}); clicking Apply again.",
-                    "WARNING")
-            apply_filters(page, job_dir, APPLY_RETRY_TIMEOUT)
-            size = ensure_size(page, job_dir, state, rep, prog)
-            ok, info = verify_screen(page, job_dir, start_d, end_d, log_sample=first_cycle)
-        if ok is not False:
-            if ok is None:
-                job_log(job_dir, f"FILTER CHECK: {info}. Continuing, the downloaded files are checked as well.",
-                        "WARNING")
-            elif first_cycle or not first_try:
-                job_log(job_dir, f"FILTER CHECK OK via [{strat}]: {info}")
-            if state["date_strategy"] != strat:
-                state["date_strategy"] = strat
-            if first_cycle and state["session_no"] == 1 and not state.get("shot_filter"):
-                state["shot_filter"] = True
-                take_shot(page, job_dir, "shot_3_after_filter")
-            return size
-        job_log(job_dir, f"FILTER CHECK FAILED via [{strat}]: {info}", "ERROR")
-        fails.append(f"[{strat}] {info}")
-        take_shot(page, job_dir, f"shot_filter_failed_{strat}")
-
-    msg = (f"The date filter {start_d:%d-%m-%Y} to {end_d:%d-%m-%Y} does not take effect: the table keeps showing "
-           f"other dates. Tried: " + " | ".join(fails))
-    if known:
-        raise RuntimeError(msg)
-    raise FatalJobError(msg)
+    llog(job_dir, f"Apply clicked: table changed={changed}, rows now {effective_rows(page)}")
 
 
 def current_page(page, size: int) -> int:
@@ -2594,15 +1997,30 @@ def fetch_page(page, job_dir: Path, dl_dir: Path, pages_dir: Path, rep: StepRepo
     rep.running(f"Page {n} of ~{total}: dates + Apply, 500 rows, go to page, download...", prog, quiet=True)
     job_log(job_dir, f"P{n} CYCLE start | {format_snapshot(collect_snapshot(dl_dir))}")
 
-    # ---- 1+2) DATA FIRST (dates + Apply, verified), THEN ROW SIZE 500 (filter verified again)
+    # ---- 1) DATA FIRST: dates + Apply
     if REAPPLY_EVERY_PAGE or first_cycle:
-        size = prepare_filtered_table(page, job_dir, rep, state, start_d, end_d, first_cycle, prog)
-    else:
-        size = ensure_size(page, job_dir, state, rep, prog)
+        ensure_dates(page, job_dir, start_d, end_d)
+        apply_filters(page, job_dir, expect_change=first_cycle)
+
+    # ---- 2) ROW SIZE: 500
     rows = effective_rows(page)
-    if rows == 0:
-        raise FatalJobError(f"No closed alarms were found between {start_d:%d-%m-%Y} and {end_d:%d-%m-%Y}.")
-    job_log(job_dir, f"P{n} after dates + Apply + size: {rows} rows on screen (page size {size}).")
+    size = state["page_size"]
+    if size is None:
+        # very first time: FULL discovery of the Items control with diagnostics
+        if rows > DEFAULT_PAGE_ROWS:
+            size = rows
+            job_log(job_dir, f"Page size already shows {rows} rows after Apply; using {rows} as the page size.")
+        else:
+            rows = pw_set_page_size(page, job_dir, rep=rep, strict=True, tag="2a_", base_progress=prog)
+            size = max(rows, 1)
+            if state["session_no"] == 1:
+                take_shot(page, job_dir, "shot_1_after_page_size")
+        state["page_size"] = size
+        job_log(job_dir, f"PAGE SIZE for this job: {size} rows per page.")
+    elif size > DEFAULT_PAGE_ROWS and rows <= DEFAULT_PAGE_ROWS:
+        rows = quick_set_size(page, job_dir, size, rep=rep, base_progress=prog)
+    rows = effective_rows(page)
+    job_log(job_dir, f"P{n} after Apply + size: {rows} rows on screen (page size {size}).")
 
     # ---- 3) NAVIGATE to page n (the cycle starts on page 1 after Apply)
     if n > 1:
@@ -2617,27 +2035,10 @@ def fetch_page(page, job_dir: Path, dl_dir: Path, pages_dir: Path, rep: StepRepo
     if size > DEFAULT_PAGE_ROWS and rows <= DEFAULT_PAGE_ROWS and not (rng and rng[1] >= rng[2]):
         raise RuntimeError(f"Only {rows} rows are shown for page {n}: the page size is not {size}.")
 
-    screen_ok, screen_info = verify_screen(page, job_dir, start_d, end_d)
-    job_log(job_dir, f"P{n} SCREEN DATE CHECK: {screen_ok} - {screen_info}", "WARNING" if screen_ok is False else "INFO")
-    if screen_ok is False:
-        raise RuntimeError(f"The date filter was lost before downloading page {n}: {screen_info}")
-
     # ---- 4) DOWNLOAD
     job_log(job_dir, f"P{n} BEFORE download | {format_snapshot(collect_snapshot(dl_dir))}")
     dest = pw_download_by_page(page, job_dir, pages_dir / f"page_{n:04d}")
     job_log(job_dir, f"P{n} AFTER download  | {format_snapshot(collect_snapshot(dl_dir))}")
-
-    file_ok, file_info = verify_file(dest, start_d, end_d)
-    job_log(job_dir, f"P{n} FILE DATE CHECK: {file_ok} - {file_info}", "WARNING" if file_ok is False else "INFO")
-    if file_ok is False:
-        dest.unlink(missing_ok=True)
-        why = ("the table showed the right dates but the 'By Page' export ignores the filter"
-               if screen_ok else "the date filter is not active")
-        msg = (f"The file downloaded for page {n} contains tickets outside {start_d:%d-%m-%Y}..{end_d:%d-%m-%Y} "
-               f"({why}): {file_info}")
-        if n <= FATAL_FILE_PAGES:
-            raise FatalJobError(msg)
-        raise RuntimeError(msg)
 
     digest = file_sha256(dest)
     if digest in state["hashes"]:
@@ -2695,8 +2096,6 @@ def download_loop(page, job_dir: Path, dl_dir: Path, pages_dir: Path, rep: StepR
                 last = fetch_page(page, job_dir, dl_dir, pages_dir, rep, monitor, browser, state, n,
                                   start_d, end_d, first_cycle=(session_pages == 0 and attempt == 1))
                 break
-            except FatalJobError:
-                raise
             except (PWError, RuntimeError) as exc:
                 if monitor.tripped or not browser.is_connected() or page.is_closed() or attempt > CYCLE_RETRIES:
                     raise
@@ -2933,9 +2332,7 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
         for old in job_dir.glob(pattern):
             old.unlink(missing_ok=True)
 
-    _FLAGS.clear()
-    state = {"files": [], "hashes": {}, "resume_page": 1, "total_pages": 1, "session_no": 0, "page_size": None,
-             "date_strategy": None}
+    state = {"files": [], "hashes": {}, "resume_page": 1, "total_pages": 1, "session_no": 0, "page_size": None}
     monitor = None
     try:
         log_system_info(job_dir)
@@ -2950,8 +2347,6 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
             try:
                 outcome = run_session(job_dir, dl_dir, pages_dir, rep, monitor, state, username, password,
                                       start_d, end_d)
-            except FatalJobError:
-                raise
             except Exception as exc:
                 reason = monitor.tripped or (str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__)
                 progressed = state["resume_page"] > resume_before
@@ -3078,35 +2473,14 @@ def render_workflow(job_dir: Path, job_id: str):
     result_path = job_dir / s1["result_file"] if s1.get("state") == "done" and s1.get("result_file") else None
     result_ok = result_path is not None and result_path.exists()
 
-    # ------------------------------------------------------------ RETRIEVE & DOWNLOAD (one section)
-    st.subheader("Retrieve & download closed alarms")
-    st.caption("Logs in, opens CLOSED ALARM and downloads every page for your date range "
-               "(Start Date picked in the calendar, 500 items per page, dates checked). "
-               "All pages are compiled into one Excel file. The browser restarts automatically when memory grows.")
+    # ------------------------------------------------------------ STEP 1
+    st.subheader("Step 1 · Retrieve closed alarms")
+    st.caption("Logs in and opens CLOSED ALARM. For EVERY page it fills Start/End Date, clicks Apply, sets 500 items "
+               "per page, goes to that page and clicks Download Alarm › By Page. All files are compiled into one "
+               "Excel. The browser is restarted automatically when memory grows.")
     show_status(s1)
     if s1["state"] == "error" and (job_dir / "error.png").exists():
         st.image(str(job_dir / "error.png"), caption="Browser screenshot when the error happened")
-
-    # the download button appears only when the compiled result exists (never while running, never disabled)
-    if result_ok:
-        rs, re_ = s1.get("range_start"), s1.get("range_end")
-        size_txt = f"{result_path.stat().st_size / 1024 / 1024:.2f} MB"
-        st.download_button(
-            "Download Result",
-            data=result_path.read_bytes(),
-            file_name=result_path.name,
-            mime=XLSX_MIME,
-            type="primary",
-            use_container_width=True,
-            on_click="ignore",
-        )
-        if isinstance(s1.get("rows"), int):
-            txt = f"{s1['rows']:,} rows · {s1.get('pages', '?')} pages · {size_txt}"
-            if rs and re_:
-                txt += f" · {date.fromisoformat(rs):%d-%m-%Y} to {date.fromisoformat(re_):%d-%m-%Y}"
-        else:
-            txt = size_txt
-        st.caption(txt)
 
     d0, d1 = default_range()
     with st.form("step1_form"):
@@ -3134,6 +2508,34 @@ def render_workflow(job_dir: Path, job_id: str):
             start_thread(retrieve_worker, job_dir, username, password, start_d, end_d)
             st.session_state["_was_busy"] = True
             st.rerun()
+
+    st.divider()
+
+    # ------------------------------------------------------------ STEP 3
+    st.subheader("Step 3 · Download Result")
+    st.caption("Just hands you the compiled file from Step 1. No processing happens here.")
+    if result_ok:
+        rs, re_ = s1.get("range_start"), s1.get("range_end")
+        size_txt = f"{result_path.stat().st_size / 1024 / 1024:.2f} MB"
+        st.download_button(
+            "Download Result",
+            data=result_path.read_bytes(),
+            file_name=result_path.name,
+            mime=XLSX_MIME,
+            type="primary",
+            use_container_width=True,
+            on_click="ignore",
+        )
+        if isinstance(s1.get("rows"), int):
+            txt = f"{s1['rows']:,} rows · {s1.get('pages', '?')} pages · {size_txt}"
+            if rs and re_:
+                txt += f" · {date.fromisoformat(rs):%d-%m-%Y} to {date.fromisoformat(re_):%d-%m-%Y}"
+        else:
+            txt = size_txt
+        st.caption(txt)
+    else:
+        st.button("Download Result", disabled=True, use_container_width=True, key="dl_disabled")
+        st.caption("🔒 Complete Step 1 first.")
 
     # ------------------------------------------------------------ extras
     st.divider()
@@ -3177,7 +2579,7 @@ def main():
     busy = get_status(job_dir, 1)["state"] == "running"
     st.fragment(run_every=POLL_SECONDS if busy else None)(render_workflow)(job_dir, job_id)
 
-    st.caption("Your credentials are used only to start the retrieval and are never written to disk or logs.")
+    st.caption("Your credentials are used only to start Step 1 and are never written to disk or logs.")
 
 
 if __name__ == "__main__":
