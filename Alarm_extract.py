@@ -15,7 +15,7 @@ NEW FLOW, repeated for EVERY page N:
                   the range, e.g. 2021, instead of downloading 250+ useless pages)
   then go back to step 1 for page N+1, until the last page.
 All page files are compiled into ONE Excel file.
-STEP 3  Download -> hand the compiled XLSX to the browser (no processing)
+UI      One section: status, form, and (when the job is done) the compiled XLSX offered for download (no processing)
 
 MEMORY MANAGEMENT (kept from the previous version)
   * Guard measures the container WORKING SET (memory.current - inactive_file), 93 %, 3 samples in a row,
@@ -3078,15 +3078,35 @@ def render_workflow(job_dir: Path, job_id: str):
     result_path = job_dir / s1["result_file"] if s1.get("state") == "done" and s1.get("result_file") else None
     result_ok = result_path is not None and result_path.exists()
 
-    # ------------------------------------------------------------ STEP 1
-    st.subheader("Step 1 · Retrieve closed alarms")
-    st.caption("Logs in and opens CLOSED ALARM. For EVERY page it picks the Start Date in the calendar, clicks Apply, sets 500 items "
-               "per page, goes to that page and clicks Download Alarm › By Page. The dates inside the table and "
-               "inside every downloaded file are checked against your range. All files are compiled into one "
-               "Excel. The browser is restarted automatically when memory grows.")
+    # ------------------------------------------------------------ RETRIEVE & DOWNLOAD (one section)
+    st.subheader("Retrieve & download closed alarms")
+    st.caption("Logs in, opens CLOSED ALARM and downloads every page for your date range "
+               "(Start Date picked in the calendar, 500 items per page, dates checked). "
+               "All pages are compiled into one Excel file. The browser restarts automatically when memory grows.")
     show_status(s1)
     if s1["state"] == "error" and (job_dir / "error.png").exists():
         st.image(str(job_dir / "error.png"), caption="Browser screenshot when the error happened")
+
+    # the download button appears only when the compiled result exists (never while running, never disabled)
+    if result_ok:
+        rs, re_ = s1.get("range_start"), s1.get("range_end")
+        size_txt = f"{result_path.stat().st_size / 1024 / 1024:.2f} MB"
+        st.download_button(
+            "Download Result",
+            data=result_path.read_bytes(),
+            file_name=result_path.name,
+            mime=XLSX_MIME,
+            type="primary",
+            use_container_width=True,
+            on_click="ignore",
+        )
+        if isinstance(s1.get("rows"), int):
+            txt = f"{s1['rows']:,} rows · {s1.get('pages', '?')} pages · {size_txt}"
+            if rs and re_:
+                txt += f" · {date.fromisoformat(rs):%d-%m-%Y} to {date.fromisoformat(re_):%d-%m-%Y}"
+        else:
+            txt = size_txt
+        st.caption(txt)
 
     d0, d1 = default_range()
     with st.form("step1_form"):
@@ -3114,34 +3134,6 @@ def render_workflow(job_dir: Path, job_id: str):
             start_thread(retrieve_worker, job_dir, username, password, start_d, end_d)
             st.session_state["_was_busy"] = True
             st.rerun()
-
-    st.divider()
-
-    # ------------------------------------------------------------ STEP 3
-    st.subheader("Step 3 · Download Result")
-    st.caption("Just hands you the compiled file from Step 1. No processing happens here.")
-    if result_ok:
-        rs, re_ = s1.get("range_start"), s1.get("range_end")
-        size_txt = f"{result_path.stat().st_size / 1024 / 1024:.2f} MB"
-        st.download_button(
-            "Download Result",
-            data=result_path.read_bytes(),
-            file_name=result_path.name,
-            mime=XLSX_MIME,
-            type="primary",
-            use_container_width=True,
-            on_click="ignore",
-        )
-        if isinstance(s1.get("rows"), int):
-            txt = f"{s1['rows']:,} rows · {s1.get('pages', '?')} pages · {size_txt}"
-            if rs and re_:
-                txt += f" · {date.fromisoformat(rs):%d-%m-%Y} to {date.fromisoformat(re_):%d-%m-%Y}"
-        else:
-            txt = size_txt
-        st.caption(txt)
-    else:
-        st.button("Download Result", disabled=True, use_container_width=True, key="dl_disabled")
-        st.caption("🔒 Complete Step 1 first.")
 
     # ------------------------------------------------------------ extras
     st.divider()
@@ -3185,7 +3177,7 @@ def main():
     busy = get_status(job_dir, 1)["state"] == "running"
     st.fragment(run_every=POLL_SECONDS if busy else None)(render_workflow)(job_dir, job_id)
 
-    st.caption("Your credentials are used only to start Step 1 and are never written to disk or logs.")
+    st.caption("Your credentials are used only to start the retrieval and are never written to disk or logs.")
 
 
 if __name__ == "__main__":
