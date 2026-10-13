@@ -1,17 +1,29 @@
 """
-PMT Alarm – Closed Alarm downloader (Playwright edition)
+PMT Alarm – Closed Alarm downloader (Playwright edition) – MEMORY-SAFE EDITION
 
-NEW FLOW (Step 1)
+FLOW
   1. Login
   2. Open the CLOSED ALARM tab
-  3. Scroll to the bottom of the table (window + internal containers), find the "Items" dropdown
-     (native select / Vuetify / MUI / Angular Material / Ant / label / pagination-first) and choose 500 instead of 10
-     (can take a while: the script WAITS until the table really shows the bigger page, not 10 rows)
-  4. Type Start Date / End Date and click Apply
-     (if the site resets the page size after Apply, 500 is selected again and verified)
+  3. Scroll to the footer, choose 500 in the "Items" dropdown (waits until the table really shows it)
+  4. Type Start Date / End Date and click Apply (re-checks the page size afterwards)
   5. For every page: Download Alarm > By Page (one file per page), click next page, repeat.
      All page files are compiled into ONE Excel file.
 STEP 3  Download -> hand the compiled XLSX to the browser (no processing)
+
+WHAT CHANGED IN THIS VERSION (memory management)
+  * The memory guard now measures the container WORKING SET (memory.current - inactive_file),
+    not raw memory.current (which includes reclaimable page cache), at 93 % and only after
+    MEM_GUARD_SAMPLES consecutive samples. It kills ONLY Chromium, never the Playwright driver.
+  * Every download is deleted from Playwright's own store after save_as (dl.delete()).
+  * JS handles returned by find_next() are disposed.
+  * Page-change detection uses a tiny JS signature (no more copying 500 rows x N columns every 400 ms).
+  * Fonts are blocked in addition to images/media, screenshots are small JPEGs, requestfailed logging is capped.
+  * Per-page diagnostics: memory before/after download, actual rows inside the downloaded file,
+    rows on screen, per-role RSS (streamlit / node / chromium) and anon / file / shmem split.
+  * BROWSER RECYCLING: when the working set or Chromium's RSS keeps growing, Chromium is closed cleanly and
+    relaunched; the new session logs in again, re-applies everything and clicks "next" (no downloads)
+    until it reaches the page where the previous session stopped. Crashes/guard trips are recovered the same way.
+  * While a step is running the Streamlit UI only shows the last 40 log lines (no screenshots / buttons).
 
 All state lives on disk in a per-session job folder (not only in st.session_state),
 so it survives websocket reconnects and page refreshes (the job id is kept in the URL).
@@ -56,18 +68,29 @@ JOBS_ROOT = Path(tempfile.gettempdir()) / "pmt_alarm_jobs"
 STALE_AFTER = 600             # a "running" step with no heartbeat for 10 min = interrupted
 JOB_MAX_AGE_HOURS = 12
 POLL_SECONDS = 3
-MEM_GUARD_FRACTION = 0.85     # kill Chromium when the container reaches 85 % of its memory limit
-MEM_LIMIT_MB_OVERRIDE = float(os.environ.get("MEM_LIMIT_MB", 0)) or None
 MONITOR_INTERVAL = 2          # seconds between diagnostic samples
-BLOCK_IMAGES = True
+BLOCK_IMAGES = True           # also blocks media + fonts
+MEM_LIMIT_MB_OVERRIDE = float(os.environ.get("MEM_LIMIT_MB", 0)) or None
+
+# ---- memory management -------------------------------------------------
+MEM_GUARD_FRACTION = 0.93     # HARD guard: working set above 93 % of the limit ...
+MEM_GUARD_SAMPLES = 3         # ... for this many consecutive samples (x MONITOR_INTERVAL s) kills Chromium
+SOFT_RECYCLE_FRACTION = 0.80  # SOFT limit: after a page, recycle the browser if working set is above this
+CHROMIUM_GROWTH_MB = 450      # ... or if Chromium RSS grew this much since the first page of the session
+RECYCLE_MIN_PAGES = 3         # never recycle before this many pages were downloaded in a session
+RECYCLE_EVERY_PAGES = 0       # >0 = also recycle the browser every N pages (0 = only on memory pressure)
+MAX_RECYCLES = 80             # planned recycles (memory pressure) allowed per job
+MAX_CRASH_RESTARTS = 6        # unplanned restarts (crash / guard trip / error) that made progress
+PROBE_FIRST_PAGES = 3         # verify the real row count inside the first N downloaded files ...
+PROBE_EVERY = 25              # ... and then every N pages
 
 SITE_UTC_OFFSET_HOURS = 7     # the site works in WIB (UTC+7)
 DATE_INPUT_FORMAT = "%d-%m-%Y"        # how the Start/End Date boxes display dates (02-10-2026)
-PAGE_SIZE_CHOICES = ("500", "250", "100", "50")  # tried in this order in the "Items" dropdown (site offers 10/50/100/250/500)
+PAGE_SIZE_CHOICES = ("500", "250", "100", "50")  # tried in this order in the "Items" dropdown
 DEFAULT_PAGE_ROWS = 10        # rows the site shows before a bigger page size is chosen
 MAX_PAGES = 3000              # safety cap for the pagination loop
 DOWNLOAD_TIMEOUT = 240        # seconds to wait for ONE "By Page" file
-PAGE_SIZE_LOAD_TIMEOUT = 240  # seconds to wait for the table to grow after choosing a bigger page size (be patient)
+PAGE_SIZE_LOAD_TIMEOUT = 240  # seconds to wait for the table to grow after choosing a bigger page size
 PAGE_SIZE_STABLE_SECONDS = 6  # a partial table (fewer rows than chosen size) must stay unchanged this long
 APPLY_LOAD_TIMEOUT = 90       # seconds to wait for the table to reload after Apply
 
@@ -75,6 +98,7 @@ XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 # =========================================================
 
 WIB = timezone(timedelta(hours=SITE_UTC_OFFSET_HOURS))
+QUIET_PHASES = ("finished", "closing", "recycling", "compile", "idle")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("pmt_alarm")
@@ -103,7 +127,7 @@ def job_log(job_dir: Path, msg: str, level: str = "INFO"):
 
 
 class StepReporter:
-    """Writes step1.json / step2.json so the UI can poll progress."""
+    """Writes step1.json so the UI can poll progress."""
 
     def __init__(self, job_dir: Path, step: int):
         self.job_dir, self.step, self.t0 = job_dir, step, time.time()
@@ -170,6 +194,25 @@ def _mb(v):
     return None if v is None else v / 1024 / 1024
 
 
+def _cg_stat() -> dict:
+    """memory.stat of the container cgroup (v2 or v1)."""
+    for p in ("/sys/fs/cgroup/memory.stat", "/sys/fs/cgroup/memory/memory.stat"):
+        try:
+            out = {}
+            for line in Path(p).read_text().splitlines():
+                parts = line.split()
+                if len(parts) == 2:
+                    try:
+                        out[parts[0]] = int(parts[1])
+                    except ValueError:
+                        pass
+            if out:
+                return out
+        except Exception:
+            continue
+    return {}
+
+
 def cgroup_memory() -> dict:
     used = _read_int("/sys/fs/cgroup/memory.current")
     limit = _read_int("/sys/fs/cgroup/memory.max")
@@ -187,8 +230,18 @@ def cgroup_memory() -> dict:
                 oom = int(line.split()[1])
     except Exception:
         pass
-    return {"used_mb": _mb(used), "limit_mb": MEM_LIMIT_MB_OVERRIDE or _mb(limit),
-            "peak_mb": _mb(peak), "oom_kills": oom}
+    st_ = _cg_stat()
+    inactive = st_.get("inactive_file", st_.get("total_inactive_file"))
+    # working set = what the kernel can NOT simply drop (this is what really leads to an OOM kill)
+    ws = used - inactive if (used is not None and inactive is not None) else used
+    return {
+        "used_mb": _mb(used), "ws_mb": _mb(ws),
+        "limit_mb": MEM_LIMIT_MB_OVERRIDE or _mb(limit),
+        "peak_mb": _mb(peak), "oom_kills": oom,
+        "anon_mb": _mb(st_.get("anon", st_.get("total_rss"))),
+        "file_mb": _mb(st_.get("file", st_.get("total_cache"))),
+        "shmem_mb": _mb(st_.get("shmem", st_.get("total_shmem"))),
+    }
 
 
 def process_tree():
@@ -219,15 +272,20 @@ def process_tree():
 
 
 def kill_browser_processes(job_dir: Path):
+    """Kill ONLY Chromium processes (never the Playwright node driver)."""
     if psutil is None:
         return
+    killed = 0
     try:
         for p in psutil.Process(os.getpid()).children(recursive=True):
             try:
-                p.kill()
+                ident = (p.name() + " " + " ".join(p.cmdline())).lower()
+                if "chrom" in ident and not p.name().startswith("node"):
+                    p.kill()
+                    killed += 1
             except Exception:
                 pass
-        job_log(job_dir, "Killed all browser child processes (memory guard).", "ERROR")
+        job_log(job_dir, f"Killed {killed} Chromium process(es) (memory guard).", "ERROR")
     except Exception as exc:
         job_log(job_dir, f"Could not kill browser processes: {exc}", "ERROR")
 
@@ -239,6 +297,7 @@ def collect_snapshot(dl_dir: Path) -> dict:
     used = cg["used_mb"]
     if used is None and tree:
         used = sum(t[3] for t in tree)
+    ws = cg["ws_mb"] if cg["ws_mb"] is not None else used
     files = []
     try:
         files = [(p.name, p.stat().st_size / 1048576) for p in dl_dir.rglob("*") if p.is_file()]
@@ -253,7 +312,10 @@ def collect_snapshot(dl_dir: Path) -> dict:
     except OSError:
         disk_shm = None
     return {
-        "used": used, "limit": cg["limit_mb"], "peak": cg["peak_mb"], "oom": cg["oom_kills"],
+        "used": used, "ws": ws, "limit": cg["limit_mb"], "peak": cg["peak_mb"], "oom": cg["oom_kills"],
+        "anon": cg["anon_mb"], "file": cg["file_mb"], "shmem": cg["shmem_mb"],
+        "py_rss": sum(t[3] for t in tree if t[1] == "streamlit"),
+        "node_rss": sum(t[3] for t in tree if t[1] == "playwright-node"),
         "chrom_n": len(chrom), "chrom_rss": sum(t[3] for t in chrom),
         "chrom_top": sorted(chrom, key=lambda t: -t[3])[:4],
         "tree": tree, "files": files,
@@ -266,10 +328,12 @@ def format_snapshot(s: dict) -> str:
     def f(v, unit="MB"):
         return "?" if v is None else f"{v:.0f}{unit}"
 
-    pct = f" ({s['used'] / s['limit']:.0%})" if s["used"] is not None and s["limit"] else ""
+    pct = f" ({s['ws'] / s['limit']:.0%})" if s.get("ws") is not None and s["limit"] else ""
     top = ", ".join(f"{t[1].replace('chromium-', '')} {t[3]:.0f}" for t in s["chrom_top"]) or "none"
     return (
-        f"mem {f(s['used'])}/{f(s['limit'])}{pct} peak={f(s['peak'])} oom_kills={s['oom']} | "
+        f"WS={f(s.get('ws'))}/{f(s['limit'])}{pct} used={f(s['used'])} anon={f(s.get('anon'))} "
+        f"file={f(s.get('file'))} shmem={f(s.get('shmem'))} peak={f(s['peak'])} oom_kills={s['oom']} | "
+        f"streamlit={f(s.get('py_rss'))} node={f(s.get('node_rss'))} "
         f"chromium procs={s['chrom_n']} rss={f(s['chrom_rss'])} [{top}] | "
         f"free: tmp={f(s['disk_tmp'])} shm={f(s['disk_shm'])}"
     )
@@ -290,10 +354,16 @@ def log_system_info(job_dir: Path):
         f"host_RAM={total} container_limit={cg['limit_mb'] and round(cg['limit_mb'])}MB "
         f"chromium={shutil.which('chromium') or shutil.which('chromium-browser')} psutil={'yes' if psutil else 'NO'}",
     )
+    lim = cg["limit_mb"]
+    if lim:
+        job_log(job_dir, f"MEMORY POLICY: hard guard at {MEM_GUARD_FRACTION:.0%} of working set "
+                         f"({lim * MEM_GUARD_FRACTION:.0f} MB, {MEM_GUARD_SAMPLES} samples in a row); "
+                         f"soft recycle at {SOFT_RECYCLE_FRACTION:.0%} ({lim * SOFT_RECYCLE_FRACTION:.0f} MB) "
+                         f"or Chromium +{CHROMIUM_GROWTH_MB} MB.")
 
 
 class DiagnosticsMonitor(threading.Thread):
-    """Samples memory / processes, logs them, and kills Chromium before the container hits its memory limit."""
+    """Samples memory / processes, logs them, and kills Chromium only under sustained real memory pressure."""
 
     def __init__(self, job_dir: Path, dl_dir: Path, rep: StepReporter):
         super().__init__(daemon=True)
@@ -306,8 +376,16 @@ class DiagnosticsMonitor(threading.Thread):
         self.peak_chromium = 0.0
         self._seen_chromium = False
         self._gone_logged = False
+        self._over = 0
         self._last_logged = 0.0
         self._last_used = 0.0
+
+    def reset(self):
+        """Called at the start of every browser session."""
+        self.tripped = None
+        self._over = 0
+        self._seen_chromium = False
+        self._gone_logged = False
 
     def run(self):
         while not self.stop_evt.wait(MONITOR_INTERVAL):
@@ -323,26 +401,34 @@ class DiagnosticsMonitor(threading.Thread):
         now = time.time()
         elapsed = now - self.t0
         s = collect_snapshot(self.dl_dir)
-        used = s["used"] or 0.0
-        self.peak_used = max(self.peak_used, used)
+        ws = s["ws"] or 0.0
+        self.peak_used = max(self.peak_used, ws)
         self.peak_chromium = max(self.peak_chromium, s["chrom_rss"])
 
         if s["chrom_n"]:
             self._seen_chromium = True
-        elif self._seen_chromium and not self._gone_logged and self.phase not in ("finished", "closing"):
+        elif self._seen_chromium and not self._gone_logged and self.phase not in QUIET_PHASES:
             self._gone_logged = True
             job_log(self.job_dir, "!!! ALL CHROMIUM PROCESSES ARE GONE (browser exited or was killed). "
                                   f"Last memory state: {format_snapshot(s)}", "ERROR")
 
-        if elapsed < 60 or now - self._last_logged >= 15 or used - self._last_used >= 100:
-            self._last_logged, self._last_used = now, used
+        if elapsed < 60 or now - self._last_logged >= 15 or ws - self._last_used >= 100:
+            self._last_logged, self._last_used = now, ws
             job_log(self.job_dir, f"MON +{int(elapsed)}s [{self.phase}] {format_snapshot(s)}")
 
         limit = s["limit"]
-        if limit and used > limit * MEM_GUARD_FRACTION and not self.tripped:
+        if self.phase in QUIET_PHASES:
+            self._over = 0
+        elif limit and ws > limit * MEM_GUARD_FRACTION:
+            self._over += 1
+        else:
+            self._over = 0
+
+        if limit and self._over >= MEM_GUARD_SAMPLES and not self.tripped:
             self.tripped = (
-                f"Memory guard stopped Chromium: the container reached {used:.0f} MB of its {limit:.0f} MB limit "
-                f"({used / limit:.0%}). Chromium used {s['chrom_rss']:.0f} MB."
+                f"Memory guard stopped Chromium: the container working set stayed above "
+                f"{MEM_GUARD_FRACTION:.0%} of the limit ({ws:.0f} of {limit:.0f} MB) for "
+                f"{MEM_GUARD_SAMPLES} samples. Chromium used {s['chrom_rss']:.0f} MB."
             )
             job_log(self.job_dir, f"!!! {self.tripped}", "ERROR")
             for pid, role, status, rss in sorted(s["tree"], key=lambda t: -t[3])[:8]:
@@ -367,22 +453,34 @@ def attach_diagnostics(job_dir: Path, browser, page):
             counters["console"] += 1
             job_log(job_dir, f"[console.{msg.type}] {msg.text[:300]}", "WARNING")
 
+    @guarded
+    def on_requestfailed(r):
+        if counters["net"] < 30:
+            counters["net"] += 1
+            job_log(job_dir, f"[requestfailed] {r.method} {r.url[:150]} -> {r.failure}", "WARNING")
+
     browser.on("disconnected", guarded(lambda *_: job_log(
         job_dir, "BROWSER DISCONNECTED (closed or crashed)", "WARNING")))
     page.on("crash", guarded(lambda *_: job_log(
         job_dir, "!!! PAGE CRASHED: the renderer process died (usually out of memory)", "ERROR")))
     page.on("console", on_console)
     page.on("pageerror", guarded(lambda err: job_log(job_dir, f"[pageerror] {str(err)[:300]}", "WARNING")))
-    page.on("requestfailed", guarded(lambda r: job_log(
-        job_dir, f"[requestfailed] {r.method} {r.url[:150]} -> {r.failure}", "WARNING")))
+    page.on("requestfailed", on_requestfailed)
 
 
 def take_shot(page, job_dir: Path, name: str):
     try:
-        page.screenshot(path=str(job_dir / f"{name}.png"), timeout=15000)
-        job_log(job_dir, f"Screenshot saved: {name}.png")
+        page.screenshot(path=str(job_dir / f"{name}.jpg"), type="jpeg", quality=50, timeout=15000)
+        job_log(job_dir, f"Screenshot saved: {name}.jpg")
     except Exception as exc:
         job_log(job_dir, f"Screenshot {name} failed: {str(exc)[:150]}", "WARNING")
+
+
+def _dispose(handle):
+    try:
+        handle.dispose()
+    except Exception:
+        pass
 
 
 # =====================================================================
@@ -709,6 +807,17 @@ COUNT_ROWS_JS = "() => {" + _FIND_TABLE + r"""
       .filter(tr => tr.querySelectorAll('td').length >= 3 && (tr.innerText || '').trim()).length;
 }"""
 
+# Tiny signature of the table (row count + first row + last row). Computed INSIDE the browser,
+# so a 500-row table is never copied to Python while we wait for a page change.
+SIG_JS = "() => {" + _FIND_TABLE + r"""
+  const t = findTable();
+  if (!t) return '';
+  const tr = t.querySelectorAll('tbody tr');
+  if (!tr.length) return '';
+  const c = e => (e.innerText || '').replace(/\s+/g, ' ').trim();
+  return tr.length + '|' + c(tr[0]) + '|' + c(tr[tr.length - 1]);
+}"""
+
 TOTAL_PAGES_JS = "() => {" + _FIND_TABLE + r"""
   const table = findTable();
   if (!table) return 0;
@@ -752,7 +861,7 @@ _ICON_TAIL_RE = re.compile(r"\s+(info|info_outline|help|help_outline|arrow_upwar
 
 
 def read_table(page):
-    """Return (headers, rows) of the visible table. rows = list of list[str]."""
+    """Return (headers, rows) of the visible table. Only used for the initial checks (it copies the whole table)."""
     data = page.evaluate(READ_TABLE_JS)
     if not data:
         return [], []
@@ -782,8 +891,15 @@ def table_sig(rows):
     return f"{len(rows)}|{'¦'.join(rows[0])}|{'¦'.join(rows[-1])}"
 
 
+def get_sig(page) -> str:
+    try:
+        return page.evaluate(SIG_JS) or ""
+    except PWError:
+        return ""
+
+
 def wait_table_change(page, old_sig, timeout=30):
-    """Wait until the table content differs from old_sig and has stopped changing."""
+    """Wait until the table content differs from old_sig and has stopped changing (used after Apply only)."""
     end = time.time() + timeout
     while time.time() < end:
         _, rows = read_table(page)
@@ -799,18 +915,23 @@ def wait_table_change(page, old_sig, timeout=30):
     return False
 
 
+def wait_sig_change(page, old, timeout=40, poll_ms=700):
+    """Light-weight page-change detection: compares a tiny signature computed inside the browser."""
+    end = time.time() + timeout
+    while time.time() < end:
+        s = get_sig(page)
+        if s and s != old:
+            page.wait_for_timeout(500)
+            if get_sig(page) == s:
+                return True
+            continue
+        page.wait_for_timeout(poll_ms)
+    return False
+
+
 # ---------------------------------------------------------------------
 #  "Items" dropdown (10 / 50 / 100 / 250 / 500) -- FOOTER DISCOVERY EDITION
-#
-#  Why the old version failed on Streamlit Cloud ("Could not find the 'Items' label"):
-#   - the footer can be below the fold or inside an INTERNAL scroll container,
-#   - it can render later than the table,
-#   - it can live inside <tfoot> (the old code ignored everything inside the table),
-#   - the label text may differ ("Items per page", "Rows per page", "Tampilkan", ...),
-#   - the site may use Vuetify / MUI / Angular Material / Ant widgets (or a virtualized table).
-#  So now: scroll every scrollable ancestor + the window to the bottom, screenshot, dump the footer DOM,
-#  enumerate controls, then try several locator strategies (every attempt is logged).
-#  The step only fails AFTER all of that has been done.
+#  (unchanged: this part already works)
 # ---------------------------------------------------------------------
 SIZE_ORDER = ["10", "50", "100", "250", "500"]
 SITE_INFO = {"framework": "generic", "virtualized": False}
@@ -1214,7 +1335,6 @@ def diagnose_footer(page, job_dir: Path, tag: str, title: str):
     append_dom(job_dir, tag, f"\n===== {title} @ {datetime.now():%H:%M:%S} =====")
     detect_site(page, job_dir)
 
-    # 4) footer HTML
     try:
         dump = page.evaluate(FOOTER_DUMP_JS)
         if dump.get("error"):
@@ -1235,7 +1355,6 @@ def diagnose_footer(page, job_dir: Path, tag: str, title: str):
     except PWError as exc:
         job_log(job_dir, f"FOOTER DUMP failed: {str(exc)[:150]}", "WARNING")
 
-    # 5) every select / combobox / button / dropdown near the bottom
     try:
         els = page.evaluate(ENUM_JS, [SELECT_LIKE_CSS])
         job_log(job_dir, f"ENUM: {len(els)} visible select/combobox/button/dropdown/input elements near the bottom")
@@ -1248,7 +1367,6 @@ def diagnose_footer(page, job_dir: Path, tag: str, title: str):
     except PWError as exc:
         job_log(job_dir, f"ENUM failed: {str(exc)[:150]}", "WARNING")
 
-    # 7) pagination controls and their parent container
     try:
         pag = page.evaluate(PAGINATION_JS, [SELECT_LIKE_CSS])
         if not pag.get("root"):
@@ -1265,7 +1383,6 @@ def diagnose_footer(page, job_dir: Path, tag: str, title: str):
     except PWError as exc:
         job_log(job_dir, f"PAGINATION probe failed: {str(exc)[:150]}", "WARNING")
 
-    # where does text like "Items" / "per page" / "Rows" exist at all?
     try:
         th = page.evaluate(TEXT_HITS_JS)
         job_log(job_dir, f"TEXT HITS ('items'/'per page'/'rows'/...): {len(th['hits'])}, document height={th['docH']}")
@@ -1289,7 +1406,6 @@ def locate_control_once(page, job_dir: Path):
       {'kind': 'native', ...}  for a real <select> that contains the sizes, or
       {'kind': 'point', cx, cy, ...} for a custom dropdown (click by coordinates), or None.
     """
-    # strategy 0: native <select> with 10/50/100/250/500 options
     try:
         info = page.evaluate(NATIVE_SELECT_JS)
         if info["matches"]:
@@ -1301,7 +1417,6 @@ def locate_control_once(page, job_dir: Path):
     except PWError as exc:
         job_log(job_dir, f"LOCATE [native <select>] -> error {str(exc)[:120]}", "WARNING")
 
-    # strategy 1: framework-specific selectors (Vuetify / MUI / Angular Material / Ant / Quasar / aria-label)
     for name, css in ITEMS_SELECTORS:
         try:
             loc = page.locator(css)
@@ -1319,7 +1434,6 @@ def locate_control_once(page, job_dir: Path):
         except PWError as exc:
             job_log(job_dir, f"LOCATE [{name}] -> error {str(exc)[:120]}", "WARNING")
 
-    # strategy 2: a text label ("Items", "Items per page", "Rows per page", "Tampilkan", ...) incl. inside <tfoot>
     try:
         res = page.evaluate(LABEL_JS, [SELECT_LIKE_CSS])
         if not res:
@@ -1340,7 +1454,6 @@ def locate_control_once(page, job_dir: Path):
     except PWError as exc:
         job_log(job_dir, f"LOCATE [text label] -> error {str(exc)[:120]}", "WARNING")
 
-    # strategy 3: pagination controls first, then the select-like control inside / around their container
     try:
         pag = page.evaluate(PAGINATION_JS, [SELECT_LIKE_CSS])
         if not pag.get("root"):
@@ -1359,7 +1472,6 @@ def locate_control_once(page, job_dir: Path):
     except PWError as exc:
         job_log(job_dir, f"LOCATE [pagination-first] -> error {str(exc)[:120]}", "WARNING")
 
-    # strategy 4: any select-like element near the bottom that currently DISPLAYS a page size (10/50/100/...)
     try:
         els = page.evaluate(ENUM_JS, [SELECT_LIKE_CSS])
         hits = [e for e in els if e["selectLike"] and e["w"] >= 30 and e["h"] >= 16
@@ -1376,11 +1488,7 @@ def locate_control_once(page, job_dir: Path):
 
 
 def find_items_control(page, job_dir: Path, tag="", rounds=4):
-    """
-    Scroll to the footer, take screenshots before/after, inspect the DOM, locate the Items control.
-    Retries a few rounds (the footer may render later than the table). Only returns None after the
-    scrolling and the full DOM inspection have been done.
-    """
+    """Scroll to the footer, screenshot, inspect the DOM, locate the Items control (retrying a few rounds)."""
     take_shot(page, job_dir, f"shot_{tag}before_scroll")
     for rnd in range(1, rounds + 1):
         scroll_to_footer(page, job_dir, f"{tag}round{rnd}")
@@ -1394,7 +1502,6 @@ def find_items_control(page, job_dir: Path, tag="", rounds=4):
         job_log(job_dir, f"Round {rnd}/{rounds}: Items control not found yet; waiting 5s (the footer may render "
                          f"later than the table), then scrolling again.", "WARNING")
         page.wait_for_timeout(5000)
-    # final inspection before giving up
     scroll_to_footer(page, job_dir, f"{tag}final")
     take_shot(page, job_dir, f"shot_{tag}after_scroll_final")
     diagnose_footer(page, job_dir, tag, "FINAL inspection before giving up")
@@ -1438,7 +1545,6 @@ def choose_size(page, job_dir: Path, size: str, tag: str = ""):
     if not ctl:
         raise RuntimeError("the Items control disappeared before selecting the size")
 
-    # native <select>: select directly
     if ctl["kind"] == "native":
         loc = page.locator("select[data-pw-items]").first
         for kw in ({"label": size}, {"value": size}):
@@ -1450,7 +1556,6 @@ def choose_size(page, job_dir: Path, size: str, tag: str = ""):
                 job_log(job_dir, f"Native select_option {kw} failed: {str(exc)[:150]}", "WARNING")
         raise RuntimeError("native select_option failed")
 
-    # custom dropdown: click the control until a list with several sizes is visible
     offsets = [0.0]
     if ctl["w"] > 60:
         offsets += [ctl["w"] / 2 - 16, -ctl["w"] / 4]
@@ -1471,7 +1576,6 @@ def choose_size(page, job_dir: Path, size: str, tag: str = ""):
         page.wait_for_timeout(300)
     take_shot(page, job_dir, f"shot_{tag}dropdown_open_{size}")
 
-    # 1) click the entry by position
     wanted = [o for o in opts if o["t"] == size]
     if wanted:
         o = sorted(wanted, key=lambda o: o["w"] * o["h"])[0]
@@ -1479,7 +1583,6 @@ def choose_size(page, job_dir: Path, size: str, tag: str = ""):
         page.mouse.click(o["x"], o["y"])
         return True
 
-    # 2) option element by exact text (Vuetify v-list-item, MUI li[role=option], mat-option, ant-select-item ...)
     opt_xpath = ("xpath=//*[(self::li or self::div or self::span or self::a or self::mat-option or self::option "
                  f"or @role='option' or @role='menuitem') and normalize-space(.)='{size}' and not(ancestor::table)]")
     try:
@@ -1490,7 +1593,6 @@ def choose_size(page, job_dir: Path, size: str, tag: str = ""):
     except (PWError, RuntimeError) as exc:
         job_log(job_dir, f"Option-by-text lookup for '{size}' failed: {str(exc)[:120]}", "WARNING")
 
-    # 3) keyboard fallback
     idx = SIZE_ORDER.index(size)
     job_log(job_dir, f"Entry '{size}' not visible; using the keyboard (ArrowDown x{idx} + Enter).", "WARNING")
     page.mouse.click(ctl["cx"], ctl["cy"])
@@ -1504,13 +1606,7 @@ def choose_size(page, job_dir: Path, size: str, tag: str = ""):
 
 def wait_rows_after_size(page, job_dir: Path, rows_before: int, size: int,
                          timeout=PAGE_SIZE_LOAD_TIMEOUT, rep=None, base_progress=0.0) -> int:
-    """
-    PATIENT wait after choosing a bigger page size. Returns when:
-      * the table shows `size` rows (e.g. 500)                      -> done right away, or
-      * the table shows more than before and has stayed unchanged for PAGE_SIZE_STABLE_SECONDS
-        (the date range simply has fewer rows than `size`).
-    Returns the number of rows finally on screen (rows_before if nothing changed before the timeout).
-    """
+    """PATIENT wait after choosing a bigger page size (see the original docstring: full size, or stable partial)."""
     t0 = time.time()
     end = t0 + timeout
     last_n, stable_since, last_log = -1, None, 0.0
@@ -1543,14 +1639,7 @@ def wait_rows_after_size(page, job_dir: Path, rows_before: int, size: int,
 
 
 def pw_set_page_size(page, job_dir: Path, rep=None, strict=True, tag="", base_progress=0.0) -> int:
-    """
-    1) detect the UI framework / virtualization
-    2) scroll to the absolute bottom (window + internal containers), screenshot, dump the footer DOM,
-       enumerate controls, log every locator attempt  (find_items_control)
-    3) choose 500 (or 250 / 100 / 50) and WAIT until the table really shows more than 10 rows
-    Returns the number of rows now shown. Fails only after the inspection above has been completed.
-    strict=False: when nothing changes, just warn (used for the re-check after Apply).
-    """
+    """Find the Items control, choose 500 (or 250 / 100 / 50) and WAIT until the table really shows more rows."""
     detect_site(page, job_dir)
     n0 = effective_rows(page)
     if n0 and n0 < DEFAULT_PAGE_ROWS and not SITE_INFO["virtualized"]:
@@ -1609,11 +1698,31 @@ BY_PAGE_XPATH = (f"xpath=//*[(self::button or self::a or self::li or self::span 
 
 
 def find_next(page):
+    """Returns (element_handle_or_None, disabled). The CALLER must dispose the returned handle."""
     handle = page.evaluate_handle(FIND_NEXT_JS)
     el = handle.as_element()
     if el is None:
+        _dispose(handle)
         return None, True
-    return el, bool(el.evaluate(IS_DISABLED_JS))
+    try:
+        return el, bool(el.evaluate(IS_DISABLED_JS))
+    except PWError:
+        _dispose(el)
+        return None, True
+
+
+def click_next(page) -> str:
+    """Click the 'next page' button. Returns 'clicked' | 'disabled' | 'none'."""
+    el, disabled = find_next(page)
+    if el is None:
+        return "none"
+    try:
+        if disabled:
+            return "disabled"
+        safe_click(el)
+        return "clicked"
+    finally:
+        _dispose(el)
 
 
 def file_sha256(path: Path) -> str:
@@ -1625,7 +1734,7 @@ def file_sha256(path: Path) -> str:
 
 
 def pw_download_by_page(page, job_dir: Path, dest_base: Path) -> Path:
-    """Open 'Download Alarm', click 'By Page', and save the file the browser downloads."""
+    """Open 'Download Alarm', click 'By Page', save the file, then delete Playwright's own copy."""
     last_exc = None
     for attempt in (1, 2, 3):
         try:
@@ -1644,6 +1753,10 @@ def pw_download_by_page(page, job_dir: Path, dest_base: Path) -> Path:
             ext = Path(dl.suggested_filename or "").suffix.lower() or ".xlsx"
             dest = Path(f"{dest_base}{ext}")
             dl.save_as(str(dest))
+            try:
+                dl.delete()          # drop Playwright's duplicate copy in downloads_path
+            except Exception:
+                pass
             if not dest.exists() or dest.stat().st_size == 0:
                 raise RuntimeError("the downloaded file is empty")
             return dest
@@ -1654,63 +1767,169 @@ def pw_download_by_page(page, job_dir: Path, dest_base: Path) -> Path:
     raise RuntimeError(f"Download Alarm > By Page failed 3 times: {str(last_exc)[:200]}")
 
 
-def download_all_pages(page, job_dir: Path, pages_dir: Path, rep: StepReporter, monitor, browser):
-    files, seen_hashes, page_no = [], {}, 0
-    _, rows = read_table(page)
-    if not rows:
-        raise RuntimeError("The table is empty for this date range (no closed alarms found).")
-    total_pages = max(1, page.evaluate(TOTAL_PAGES_JS))
-    job_log(job_dir, f"Starting page download: {len(rows)} rows on screen, ~{total_pages} page(s).")
+def probe_xlsx_rows(path: Path) -> int:
+    """Real data-row count inside a downloaded XLSX (streaming, header excluded). -1 = unknown."""
+    if path.suffix.lower() != ".xlsx":
+        return -1
+    try:
+        wb = load_workbook(path, read_only=True, data_only=True)
+    except Exception:
+        return -1
+    try:
+        n = 0
+        for row in wb.worksheets[0].iter_rows(values_only=True):
+            if any(c not in (None, "") for c in row):
+                n += 1
+        return max(0, n - 1)
+    except Exception:
+        return -1
+    finally:
+        wb.close()
+
+
+def recycle_reason(snap: dict, baseline, session_pages: int):
+    """Decide (between two pages) whether the browser should be closed and relaunched."""
+    if RECYCLE_EVERY_PAGES and session_pages >= RECYCLE_EVERY_PAGES:
+        return f"scheduled recycle after {session_pages} pages"
+    if session_pages < RECYCLE_MIN_PAGES:
+        return None
+    limit = snap.get("limit")
+    ws = snap.get("ws")
+    if limit and ws and ws > limit * SOFT_RECYCLE_FRACTION:
+        return f"working set {ws:.0f} MB is above {SOFT_RECYCLE_FRACTION:.0%} of the {limit:.0f} MB limit"
+    if baseline and snap["chrom_rss"] > baseline + CHROMIUM_GROWTH_MB:
+        return (f"Chromium RSS grew from {baseline:.0f} MB to {snap['chrom_rss']:.0f} MB "
+                f"(+{CHROMIUM_GROWTH_MB} MB allowed)")
+    return None
+
+
+def skip_to_page(page, job_dir: Path, target: int, rep: StepReporter, monitor, browser, total_pages: int):
+    """After a browser restart: click 'next' (no downloads) until `target` page is displayed."""
+    cur = 1
+    t0 = time.time()
+    job_log(job_dir, f"RESUME: skipping forward from page 1 to page {target} (no downloads)...")
+    while cur < target:
+        old = get_sig(page)
+        res = click_next(page)
+        if res != "clicked":
+            raise RuntimeError(f"Could not skip forward to page {target}: next button state '{res}' at page {cur}.")
+        if not wait_sig_change(page, old, 60, poll_ms=400):
+            raise RuntimeError(f"Table did not change while skipping to page {target} (stuck at page {cur}).")
+        cur += 1
+        if monitor.tripped:
+            raise RuntimeError(monitor.tripped)
+        if not browser.is_connected() or page.is_closed():
+            raise RuntimeError("Chromium exited while skipping forward.")
+        if cur % 10 == 0 or cur == target:
+            msg = f"Resuming: moved to page {cur} of {target} ({int(time.time() - t0)}s)"
+            rep.running(msg, 0.46 + 0.44 * min((cur - 1) / max(total_pages, 1), 1.0), quiet=(cur % 20 != 0))
+            job_log(job_dir, msg)
+    job_log(job_dir, f"RESUME: now on page {target} after {int(time.time() - t0)}s.")
+
+
+def download_pages(page, job_dir: Path, dl_dir: Path, pages_dir: Path, rep: StepReporter,
+                   monitor, browser, state: dict, start_page: int) -> str:
+    """
+    Download every page starting at `start_page`. Returns 'done' (last page reached) or 'recycle'
+    (memory pressure: state['resume_page'] already points at the next page to download).
+    """
+    n_screen = effective_rows(page)
+    if n_screen == 0:
+        raise RuntimeError("The table is empty for this date range (no closed alarms found)."
+                           if start_page == 1 else "The table is empty after resuming; cannot continue.")
+    state["total_pages"] = max(state["total_pages"], start_page, int(page.evaluate(TOTAL_PAGES_JS) or 0))
+    job_log(job_dir, f"Starting page download at page {start_page}: {n_screen} rows on screen, "
+                     f"~{state['total_pages']} page(s).")
+
+    page_no = start_page - 1
+    session_pages = 0
+    baseline = None
 
     while True:
         page_no += 1
-        total_pages = max(total_pages, page_no, page.evaluate(TOTAL_PAGES_JS))
-        rep.running(f"Page {page_no} of ~{total_pages}: downloading 'By Page' ({len(rows)} rows on screen)...",
-                    0.46 + 0.44 * min((page_no - 1) / total_pages, 1.0))
+        try:
+            state["total_pages"] = max(state["total_pages"], page_no, int(page.evaluate(TOTAL_PAGES_JS) or 0))
+        except PWError:
+            pass
+        total = state["total_pages"]
+        rep.running(f"Page {page_no} of ~{total}: downloading 'By Page'...",
+                    0.46 + 0.44 * min((page_no - 1) / max(total, 1), 1.0))
+
+        job_log(job_dir, f"P{page_no} BEFORE download | {format_snapshot(collect_snapshot(dl_dir))}")
         dest = pw_download_by_page(page, job_dir, pages_dir / f"page_{page_no:04d}")
+        job_log(job_dir, f"P{page_no} AFTER download  | {format_snapshot(collect_snapshot(dl_dir))}")
+
         digest = file_sha256(dest)
-        if digest in seen_hashes:
-            job_log(job_dir, f"Page {page_no}: the file is identical to page {seen_hashes[digest]}; skipped.", "WARNING")
+        if digest in state["hashes"]:
+            job_log(job_dir, f"Page {page_no}: the file is identical to page {state['hashes'][digest]}; skipped.",
+                    "WARNING")
             dest.unlink(missing_ok=True)
         else:
-            seen_hashes[digest] = page_no
-            files.append(dest)
+            state["hashes"][digest] = page_no
+            state["files"].append(dest)
             job_log(job_dir, f"Page {page_no}: saved {dest.name} ({dest.stat().st_size / 1024:.0f} KB)")
+        state["resume_page"] = page_no + 1
+        session_pages += 1
 
-        if monitor is not None and monitor.tripped:
+        if page_no <= PROBE_FIRST_PAGES or page_no % PROBE_EVERY == 0:
+            n_file = probe_xlsx_rows(dest) if dest.exists() else -1
+            n_scr = count_rows(page)
+            level = "WARNING" if n_file not in (-1, n_scr) else "INFO"
+            job_log(job_dir, f"P{page_no} VERIFY file_rows={n_file} screen_rows={n_scr} "
+                             f"size={dest.stat().st_size / 1024 if dest.exists() else 0:.0f}KB", level)
+
+        snap = collect_snapshot(dl_dir)
+        job_log(job_dir, f"P{page_no} DONE            | {format_snapshot(snap)}")
+        if baseline is None:
+            baseline = snap["chrom_rss"]
+
+        if monitor.tripped:
             raise RuntimeError(monitor.tripped)
         if not browser.is_connected() or page.is_closed():
             raise RuntimeError("Chromium exited while downloading pages.")
         if page_no >= MAX_PAGES:
             job_log(job_dir, f"Reached the safety cap of {MAX_PAGES} pages.", "WARNING")
-            break
+            return "done"
 
         nxt, disabled = find_next(page)
         if nxt is None:
             job_log(job_dir, "No 'next page' button found: assuming this is the only/last page.", "WARNING")
-            break
+            return "done"
         if disabled:
+            _dispose(nxt)
             job_log(job_dir, f"'Next' is disabled on page {page_no}: that was the last page.")
-            break
+            return "done"
 
-        old = table_sig(rows)
+        reason = recycle_reason(snap, baseline, session_pages)
+        if reason:
+            _dispose(nxt)
+            job_log(job_dir, f"RECYCLE requested after page {page_no}: {reason}. "
+                             f"The browser will be restarted and resume at page {page_no + 1}.", "WARNING")
+            return "recycle"
+
+        old = get_sig(page)
         changed = False
         for attempt in (1, 2):
             safe_click(nxt)
-            if wait_table_change(page, old, 40):
+            _dispose(nxt)
+            nxt = None
+            if wait_sig_change(page, old, 40):
                 changed = True
                 break
-            job_log(job_dir, f"Page {page_no}: table did not change after clicking next (attempt {attempt}).", "WARNING")
+            job_log(job_dir, f"Page {page_no}: table did not change after clicking next (attempt {attempt}).",
+                    "WARNING")
             nxt, disabled = find_next(page)
-            if nxt is None or disabled:
+            if nxt is None:
                 break
+            if disabled:
+                _dispose(nxt)
+                nxt = None
+                break
+        if nxt is not None:
+            _dispose(nxt)
         if not changed:
             job_log(job_dir, "Table stopped changing: assuming the last page was reached.")
-            break
-        _, rows = read_table(page)
-        if not rows:
-            break
-    return files, page_no
+            return "done"
 
 
 # =====================================================================
@@ -1771,7 +1990,7 @@ def unique_names(header):
 
 
 def compile_files(files, out_path: Path, job_dir: Path, rep: StepReporter) -> int:
-    """Merge every page file into one XLSX (columns matched by header name). Returns the row count."""
+    """Merge every page file into one XLSX (columns matched by header name). Streaming: no DataFrames. Returns rows."""
     master, seen, headers = [], set(), []
     for f in files:                                   # pass 1: collect the columns
         gen = iter_file_rows(f)
@@ -1814,7 +2033,9 @@ def compile_files(files, out_path: Path, job_dir: Path, rep: StepReporter) -> in
         if hasattr(gen, "close"):
             gen.close()
         total += count
-        job_log(job_dir, f"Compiled {f.name}: {count:,} rows")
+        if idx < 3 or (idx + 1) % 20 == 0 or idx + 1 == len(files):
+            job_log(job_dir, f"Compiled {f.name}: {count:,} rows (total {total:,}) | "
+                             f"{format_snapshot(collect_snapshot(job_dir))}")
         rep.running(f"Compiling files into one Excel: {idx + 1}/{len(files)} done, {total:,} rows so far...",
                     0.90 + 0.08 * (idx + 1) / len(files), quiet=True)
     wb.save(out_path)
@@ -1822,115 +2043,185 @@ def compile_files(files, out_path: Path, job_dir: Path, rep: StepReporter) -> in
 
 
 # =====================================================================
-#  STEP 1 worker
-#  login -> CLOSED ALARM -> Items 500 -> dates -> Apply -> download page by page -> compile
+#  One browser SESSION: login -> CLOSED ALARM -> 500 -> dates -> Apply -> (skip forward) -> download pages
+# =====================================================================
+def run_session(job_dir: Path, dl_dir: Path, pages_dir: Path, rep: StepReporter, monitor: DiagnosticsMonitor,
+                state: dict, username: str, password: str, start_d: date, end_d: date) -> str:
+    first = state["session_no"] == 1
+    resume_page = state["resume_page"]
+    total = max(state["total_pages"], 1)
+
+    def prog(x):  # progress for the setup phase; later sessions stay in the download band
+        return x if first else 0.46 + 0.44 * min((resume_page - 1) / total, 1.0)
+
+    shutil.rmtree(dl_dir, ignore_errors=True)   # Playwright's temp download folder (page files live in pages_dir)
+    dl_dir.mkdir(parents=True, exist_ok=True)
+    monitor.reset()
+    monitor.phase = "starting"
+    tag = "" if first else f"s{state['session_no']}_"
+
+    job_log(job_dir, f"=== BROWSER SESSION {state['session_no']} starting (resume at page {resume_page}) | "
+                     f"{format_snapshot(collect_snapshot(dl_dir))}")
+    rep.running("Starting browser..." if first else
+                f"Restarting the browser (session {state['session_no']}), resuming at page {resume_page}...",
+                prog(0.05))
+
+    with sync_playwright() as pw:
+        browser = launch_browser(pw, job_dir, dl_dir)
+        page = None
+        context = None
+        try:
+            context = browser.new_context(accept_downloads=True, viewport={"width": 1600, "height": 1000})
+            if BLOCK_IMAGES:
+                context.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in ("image", "media", "font")
+                    else route.continue_(),
+                )
+            page = context.new_page()
+            page.set_default_timeout(DEFAULT_TIMEOUT * 1000)
+            attach_diagnostics(job_dir, browser, page)
+
+            monitor.phase = "login"
+            rep.running("Logging in...", prog(0.10), quiet=not first)
+            pw_login(page, username, password)
+
+            monitor.phase = "alarm-page"
+            rep.running("Opening alarm page...", prog(0.15), quiet=not first)
+            pw_open_alarm_page(page)
+            pw_scroll_to_alarm_section(page)
+
+            rep.running("Opening CLOSED ALARM tab...", prog(0.20), quiet=not first)
+            pw_click_closed_alarm_tab(page, job_dir)
+            if first:
+                take_shot(page, job_dir, "shot_0_closed_alarm_tab")
+
+            monitor.phase = "footer-wait"
+            rep.running("Waiting for the table footer (pagination) to render...", prog(0.22), quiet=not first)
+            wait_footer_ready(page, job_dir, timeout=60)
+
+            monitor.phase = "page-size"
+            rep.running("Setting items per page to 500 (this may take a while, please wait)...", prog(0.24))
+            rows_now = pw_set_page_size(page, job_dir, rep=rep, strict=True, tag=f"2a_{tag}",
+                                        base_progress=prog(0.26))
+            if first:
+                take_shot(page, job_dir, "shot_1_after_page_size")
+            rep.running(f"Items per page set: {rows_now} rows on screen.", prog(0.32), quiet=not first)
+
+            monitor.phase = "filters"
+            rep.running(f"Setting Start Date {start_d:%d-%m-%Y} and End Date {end_d:%d-%m-%Y}...", prog(0.34),
+                        quiet=not first)
+            pw_set_date(page, job_dir, "Start Date", start_d)
+            pw_set_date(page, job_dir, "End Date", end_d)
+            if first:
+                take_shot(page, job_dir, "shot_2_filters")
+
+            old_sig = get_sig(page)
+            rep.running("Applying the filter (waiting for the table to reload)...", prog(0.38), quiet=not first)
+            pw_click_apply(page)
+            wait_sig_change(page, old_sig, APPLY_LOAD_TIMEOUT)
+            wait_loading_done(page)
+            page.wait_for_timeout(1000)
+            rows_after = effective_rows(page)
+            job_log(job_dir, f"After Apply the table shows {rows_after} rows.")
+
+            # The site may reset "Items" to 10 when the filter is applied: check and re-select 500.
+            if rows_after == DEFAULT_PAGE_ROWS:
+                job_log(job_dir, "Table shows exactly 10 rows after Apply: the page size may have been "
+                                 "reset, selecting 500 again...", "WARNING")
+                rep.running("Page size looks reset to 10 after Apply, selecting 500 again...", prog(0.42))
+                rows_after = pw_set_page_size(page, job_dir, rep=rep, strict=False,
+                                              tag=f"3a_{tag}", base_progress=prog(0.42))
+            if first:
+                take_shot(page, job_dir, "shot_3_after_apply")
+
+            if resume_page > 1:
+                monitor.phase = "resume-skip"
+                skip_to_page(page, job_dir, resume_page, rep, monitor, browser, total)
+
+            monitor.phase = "download-pages"
+            rep.running(f"Downloading page by page ({rows_after} rows per page)...", prog(0.46))
+            outcome = download_pages(page, job_dir, dl_dir, pages_dir, rep, monitor, browser, state, resume_page)
+            if outcome == "done" and first:
+                take_shot(page, job_dir, "shot_4_last_page")
+            return outcome
+        except Exception:
+            job_log(job_dir, "State at failure: " + format_snapshot(collect_snapshot(dl_dir)), "ERROR")
+            if page is not None:
+                try:
+                    page.screenshot(path=str(job_dir / "error.png"), timeout=10000)
+                except Exception:
+                    pass
+            raise
+        finally:
+            monitor.phase = "closing"
+            for closer in (context, browser):
+                try:
+                    if closer is not None:
+                        closer.close()
+                except Exception:
+                    pass
+
+
+# =====================================================================
+#  STEP 1 worker: runs sessions (restarting the browser when needed), then compiles
 # =====================================================================
 def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, end_d: date):
     rep = StepReporter(job_dir, 1)
     dl_dir = job_dir / "dl"
     pages_dir = job_dir / "pages"
-    for d in (dl_dir, pages_dir):
-        shutil.rmtree(d, ignore_errors=True)
-        d.mkdir(parents=True, exist_ok=True)
-    for pattern in ("shot_*.png", "error.png", "dom_*.txt", "result_*.xlsx", "result.part"):
+    shutil.rmtree(pages_dir, ignore_errors=True)
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    dl_dir.mkdir(parents=True, exist_ok=True)
+    for pattern in ("shot_*.png", "shot_*.jpg", "error.png", "dom_*.txt", "result_*.xlsx", "result.part"):
         for old in job_dir.glob(pattern):
             old.unlink(missing_ok=True)
 
+    state = {"files": [], "hashes": {}, "resume_page": 1, "total_pages": 1, "session_no": 0}
     monitor = None
     try:
         log_system_info(job_dir)
         job_log(job_dir, f"Requested range: {start_d:%d-%m-%Y} -> {end_d:%d-%m-%Y}")
-        rep.running("Starting browser...", 0.05)
         monitor = DiagnosticsMonitor(job_dir, dl_dir, rep)
         monitor.start()
 
-        with sync_playwright() as pw:
-            browser = launch_browser(pw, job_dir, dl_dir)
-            page = None
+        recycles = crash_restarts = 0
+        while True:
+            state["session_no"] += 1
+            resume_before = state["resume_page"]
             try:
-                context = browser.new_context(accept_downloads=True, viewport={"width": 1600, "height": 1000})
-                if BLOCK_IMAGES:
-                    context.route(
-                        "**/*",
-                        lambda route: route.abort()
-                        if route.request.resource_type in ("image", "media")
-                        else route.continue_(),
-                    )
-                page = context.new_page()
-                page.set_default_timeout(DEFAULT_TIMEOUT * 1000)
-                attach_diagnostics(job_dir, browser, page)
-
-                # ---- 1) LOGIN
-                monitor.phase = "login"
-                rep.running("Logging in...", 0.10)
-                pw_login(page, username, password)
-
-                monitor.phase = "alarm-page"
-                rep.running("Opening alarm page...", 0.15)
-                pw_open_alarm_page(page)
-                pw_scroll_to_alarm_section(page)
-
-                # ---- 2) CLOSED ALARM tab
-                rep.running("Opening CLOSED ALARM tab...", 0.20)
-                pw_click_closed_alarm_tab(page, job_dir)
-                take_shot(page, job_dir, "shot_0_closed_alarm_tab")
-
-                monitor.phase = "footer-wait"
-                rep.running("Waiting for the table footer (pagination) to render...", 0.22)
-                wait_footer_ready(page, job_dir, timeout=60)
-
-                # ---- 3) Items per page -> 500 (wait until the table really shows the bigger page)
-                monitor.phase = "page-size"
-                rep.running("Setting items per page to 500 (this may take a while, please wait)...", 0.24)
-                rows_now = pw_set_page_size(page, job_dir, rep=rep, strict=True, tag="2a_", base_progress=0.26)
-                take_shot(page, job_dir, "shot_1_after_page_size")
-                rep.running(f"Items per page set: {rows_now} rows on screen.", 0.32)
-
-                # ---- 4) Dates + Apply
-                monitor.phase = "filters"
-                rep.running(f"Setting Start Date {start_d:%d-%m-%Y} and End Date {end_d:%d-%m-%Y}...", 0.34)
-                pw_set_date(page, job_dir, "Start Date", start_d)
-                pw_set_date(page, job_dir, "End Date", end_d)
-                take_shot(page, job_dir, "shot_2_filters")
-
-                _, rows_before = read_table(page)
-                rep.running("Applying the filter (waiting for the table to reload)...", 0.38)
-                pw_click_apply(page)
-                wait_table_change(page, table_sig(rows_before), APPLY_LOAD_TIMEOUT)
-                wait_loading_done(page)
-                page.wait_for_timeout(1000)
-                rows_after = effective_rows(page)
-                job_log(job_dir, f"After Apply the table shows {rows_after} rows.")
-
-                # The site may reset "Items" to 10 when the filter is applied: check and re-select 500.
-                if rows_after == DEFAULT_PAGE_ROWS:
-                    job_log(job_dir, "Table shows exactly 10 rows after Apply: the page size may have been "
-                                     "reset, selecting 500 again...", "WARNING")
-                    rep.running("Page size looks reset to 10 after Apply, selecting 500 again...", 0.42)
-                    rows_after = pw_set_page_size(page, job_dir, rep=rep, strict=False,
-                                                  tag="3a_", base_progress=0.42)
-                take_shot(page, job_dir, "shot_3_after_apply")
-
-                # ---- 5) Download page by page
-                monitor.phase = "download-pages"
-                rep.running(f"Downloading page by page ({rows_after} rows per page)...", 0.46)
-                files, pages = download_all_pages(page, job_dir, pages_dir, rep, monitor, browser)
-                take_shot(page, job_dir, "shot_4_last_page")
-            except Exception:
-                job_log(job_dir, "State at failure: " + format_snapshot(collect_snapshot(dl_dir)), "ERROR")
-                if page is not None:
-                    try:
-                        page.screenshot(path=str(job_dir / "error.png"), timeout=10000)
-                    except Exception:
-                        pass
+                outcome = run_session(job_dir, dl_dir, pages_dir, rep, monitor, state, username, password,
+                                      start_d, end_d)
+            except Exception as exc:
+                reason = monitor.tripped or (str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__)
+                progressed = state["resume_page"] > resume_before
+                if progressed and crash_restarts < MAX_CRASH_RESTARTS:
+                    crash_restarts += 1
+                    job_log(job_dir, f"Session {state['session_no']} failed after progress "
+                                     f"(pages saved up to {state['resume_page'] - 1}): {reason[:250]} -> "
+                                     f"restart {crash_restarts}/{MAX_CRASH_RESTARTS}, resuming at page "
+                                     f"{state['resume_page']}.", "ERROR")
+                    kill_browser_processes(job_dir)
+                    time.sleep(2)
+                    continue
+                if monitor.tripped:
+                    raise RuntimeError(monitor.tripped)
                 raise
-            finally:
-                monitor.phase = "closing"
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+            if outcome == "recycle":
+                recycles += 1
+                if recycles > MAX_RECYCLES:
+                    raise RuntimeError(f"Browser was recycled {MAX_RECYCLES} times; stopping at page "
+                                       f"{state['resume_page']}.")
+                monitor.phase = "recycling"
+                job_log(job_dir, f"Browser recycle {recycles}/{MAX_RECYCLES} done; next page "
+                                 f"{state['resume_page']}. Memory after close: "
+                                 f"{format_snapshot(collect_snapshot(dl_dir))}")
+                time.sleep(2)
+                continue
+            break
 
+        files = sorted(state["files"])
         if not files:
             raise RuntimeError("No page files were downloaded.")
         monitor.phase = "compile"
@@ -1955,8 +2246,9 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
         if monitor is not None:
             monitor.phase = "finished"
             monitor.stop()
-            job_log(job_dir, f"SUMMARY: peak container memory={monitor.peak_used:.0f}MB, "
+            job_log(job_dir, f"SUMMARY: peak working set={monitor.peak_used:.0f}MB, "
                              f"peak Chromium RSS={monitor.peak_chromium:.0f}MB, "
+                             f"browser sessions={state['session_no']}, "
                              f"memory guard tripped={'YES' if monitor.tripped else 'no'}")
         shutil.rmtree(dl_dir, ignore_errors=True)
         shutil.rmtree(pages_dir, ignore_errors=True)
@@ -2003,6 +2295,19 @@ def default_range():
     return prev_month_last_day.replace(day=1), today
 
 
+def read_log_tail(log_file: Path, n: int):
+    """Last n lines of the log without loading a huge file into memory."""
+    try:
+        size = log_file.stat().st_size
+        with open(log_file, "rb") as fh:
+            fh.seek(max(0, size - 64 * 1024))
+            data = fh.read().decode("utf-8", errors="replace")
+        lines = data.splitlines()
+        return lines[-n:]
+    except OSError:
+        return []
+
+
 def render_workflow(job_dir: Path, job_id: str):
     s1 = get_status(job_dir, 1)
     busy = s1["state"] == "running"
@@ -2019,7 +2324,7 @@ def render_workflow(job_dir: Path, job_id: str):
     st.subheader("Step 1 · Retrieve closed alarms")
     st.caption("Logs in, opens CLOSED ALARM, sets 500 items per page (waits until the table really shows them), "
                "fills Start/End Date and clicks Apply, then clicks Download Alarm › By Page on every page "
-               "and compiles all files into one Excel.")
+               "and compiles all files into one Excel. The browser is restarted automatically when memory grows.")
     show_status(s1)
     if s1["state"] == "error" and (job_dir / "error.png").exists():
         st.image(str(job_dir / "error.png"), caption="Browser screenshot when the error happened")
@@ -2058,6 +2363,7 @@ def render_workflow(job_dir: Path, job_id: str):
     st.caption("Just hands you the compiled file from Step 1. No processing happens here.")
     if result_ok:
         rs, re_ = s1.get("range_start"), s1.get("range_end")
+        size_txt = f"{result_path.stat().st_size / 1024 / 1024:.2f} MB"
         st.download_button(
             "Download Result",
             data=result_path.read_bytes(),
@@ -2067,10 +2373,13 @@ def render_workflow(job_dir: Path, job_id: str):
             use_container_width=True,
             on_click="ignore",
         )
-        st.caption(f"{s1.get('rows', '?'):,} rows · {s1.get('pages', '?')} pages · "
-                   f"{result_path.stat().st_size / 1024 / 1024:.2f} MB"
-                   + (f" · {date.fromisoformat(rs):%d-%m-%Y} to {date.fromisoformat(re_):%d-%m-%Y}" if rs and re_ else "")
-                   if isinstance(s1.get("rows"), int) else f"{result_path.stat().st_size / 1024 / 1024:.2f} MB")
+        if isinstance(s1.get("rows"), int):
+            txt = f"{s1['rows']:,} rows · {s1.get('pages', '?')} pages · {size_txt}"
+            if rs and re_:
+                txt += f" · {date.fromisoformat(rs):%d-%m-%Y} to {date.fromisoformat(re_):%d-%m-%Y}"
+        else:
+            txt = size_txt
+        st.caption(txt)
     else:
         st.button("Download Result", disabled=True, use_container_width=True, key="dl_disabled")
         st.caption("🔒 Complete Step 1 first.")
@@ -2079,16 +2388,21 @@ def render_workflow(job_dir: Path, job_id: str):
     st.divider()
     with st.expander("Diagnostics (log, memory, screenshots)"):
         log_file = job_dir / "job.log"
-        all_lines = log_file.read_text(encoding="utf-8").splitlines() if log_file.exists() else []
-        st.code("\n".join(all_lines[-150:]) or "(empty)", language=None)
-        if all_lines:
-            st.download_button("Download full log (job.log)", data="\n".join(all_lines),
-                               file_name=f"job_{job_id}.log", mime="text/plain", on_click="ignore", key="dl_log")
-        for dom in sorted(job_dir.glob("dom_*.txt")):
-            st.download_button(f"Download {dom.name} (footer DOM dump)", data=dom.read_bytes(),
-                               file_name=dom.name, mime="text/plain", on_click="ignore", key=f"dl_{dom.name}")
-        for shot in sorted(job_dir.glob("shot_*.png")):
-            st.image(str(shot), caption=shot.stem)
+        if busy:
+            # keep the UI light while the worker runs: tail only, no screenshots / download buttons
+            st.code("\n".join(read_log_tail(log_file, 40)) or "(empty)", language=None)
+            st.caption("Full log, DOM dumps and screenshots appear here when the step finishes.")
+        else:
+            all_lines = log_file.read_text(encoding="utf-8").splitlines() if log_file.exists() else []
+            st.code("\n".join(all_lines[-150:]) or "(empty)", language=None)
+            if all_lines:
+                st.download_button("Download full log (job.log)", data="\n".join(all_lines),
+                                   file_name=f"job_{job_id}.log", mime="text/plain", on_click="ignore", key="dl_log")
+            for dom in sorted(job_dir.glob("dom_*.txt")):
+                st.download_button(f"Download {dom.name} (footer DOM dump)", data=dom.read_bytes(),
+                                   file_name=dom.name, mime="text/plain", on_click="ignore", key=f"dl_{dom.name}")
+            for shot in sorted(job_dir.glob("shot_*.jpg")):
+                st.image(str(shot), caption=shot.stem)
     if st.button("🗑️ Delete my files & start over", disabled=busy):
         shutil.rmtree(job_dir, ignore_errors=True)
         st.query_params.clear()
