@@ -3,8 +3,8 @@ PMT Alarm – Closed Alarm downloader (Playwright edition) – PER-PAGE CYCLE ED
 
 The site resets "Items per page" when the table moves to another page, so the page size can NOT be set once.
 NEW FLOW, repeated for EVERY page N:
-  1. DATA FIRST : type Start/End Date (3 commit strategies: Tab / Enter / JS events), click Apply
-                  and VERIFY THE FILTER: the dates inside the table rows must fall in the chosen range
+  1. DATA FIRST : pick the Start Date IN THE CALENDAR (the boxes cannot be typed into; the site fills End Date
+                  with today), click Apply and VERIFY THE FILTER: the row dates must fall in the chosen range
   2. ROW SIZE   : set Items per page to 500 (the table shows 500 rows); the filter is verified again,
                   because changing the page size may reload the table without the dates
   3. NAVIGATE   : for N > 1 click page N (page-number button, or Next until it is reached);
@@ -772,12 +772,335 @@ def mark_control(page, kind: str, timeout=DEFAULT_TIMEOUT):
     raise RuntimeError(f"Could not find the '{kind}' control next to the Closed Alarm table (result: {res}).")
 
 
-DATE_STRATEGIES = ("tab", "enter", "js")
-_DATE_MODES = {
-    "tab": ("typed", "digits"),                 # type the date, press Tab
-    "enter": ("typed+enter", "digits+enter"),   # type the date, press Enter, then Tab (commits date-pickers)
-    "js": ("js", "js+enter"),                   # set the value + input/change/blur events, optionally Enter
-}
+# =====================================================================
+#  CALENDAR date picker: the Start/End Date boxes cannot be typed into, the date must be CLICKED in the calendar.
+#  The site fills End Date with the current day by itself once Start Date is chosen.
+#  The calendar's HTML is unknown, so the picker is detected generically: the smallest element that contains
+#  at least 28 different day numbers (1..31) and the month buttons; its header ("Oktober 2026") is parsed,
+#  the previous / next month buttons are clicked until the right month shows, then the day cell is clicked.
+# =====================================================================
+CAL_COMMON_JS = _FIND_TABLE + r"""
+  const vis = el => (el.offsetParent !== null || el.getClientRects().length > 0) && el.getBoundingClientRect().width > 0;
+  const own = el => Array.from(el.childNodes).filter(n => n.nodeType === 3)
+                         .map(n => n.textContent).join('').replace(/\s+/g, ' ').trim();
+  const clsOf = e => (e && e.getAttribute && e.getAttribute('class')) || '';
+  const meta = e => {
+    let s = (e.getAttribute('aria-label') || '') + ' ' + (e.getAttribute('title') || '') + ' ' + clsOf(e) + ' ' +
+            (e.getAttribute('data-testid') || '') + ' ' + (e.innerText || '');
+    Array.from(e.querySelectorAll('*')).slice(0, 4).forEach(c => {
+      s += ' ' + clsOf(c) + ' ' + (c.getAttribute('data-testid') || '') + ' ' + (c.getAttribute('aria-label') || '');
+    });
+    return s.toLowerCase();
+  };
+  const PREV = /prev|chevron[_-]?left|arrow[_-]?back|arrow[_-]?left|navigate[_-]?before|angle-left|caret-left|‹|«|(^|[^a-z])left([^a-z]|$)/;
+  const NEXT = /next|chevron[_-]?right|arrow[_-]?forward|arrow[_-]?right|navigate[_-]?next|angle-right|caret-right|›|»|(^|[^a-z])right([^a-z]|$)/;
+  const isDis = b => !!(b.disabled || b.getAttribute('aria-disabled') === 'true' || /disabled/.test(clsOf(b).toLowerCase()));
+  const navBtn = (root, dir) => {
+    const rx = dir === 'prev' ? PREV : NEXT;
+    const notDay = el => !/^\d{1,2}$/.test((el.innerText || '').trim());
+    let c = Array.from(root.querySelectorAll('button, [role="button"], a')).filter(el => vis(el) && notDay(el));
+    let hit = c.filter(el => rx.test(meta(el)));
+    if (!hit.length) {
+      c = Array.from(root.querySelectorAll('i, svg, span')).filter(el => vis(el) && el.children.length <= 1 && notDay(el));
+      hit = c.filter(el => rx.test(meta(el)));
+    }
+    const noYear = hit.filter(el => !/year|decade/.test(meta(el)));
+    if (noYear.length) hit = noYear;
+    return hit[0] || null;
+  };
+"""
+
+CAL_FIND_JS = "() => {" + CAL_COMMON_JS + r"""
+  document.querySelectorAll('[data-pw-cal]').forEach(e => e.removeAttribute('data-pw-cal'));
+  const table = findTable();
+  const leaves = Array.from(document.querySelectorAll('body *')).filter(e => {
+    const t = own(e);
+    if (!/^\d{1,2}$/.test(t)) return false;
+    const n = parseInt(t, 10);
+    if (n < 1 || n > 31) return false;
+    if (table && table.contains(e)) return false;
+    return vis(e);
+  });
+  if (leaves.length < 28) return {found: false, leaves: leaves.length};
+  const sets = new Map();
+  leaves.forEach(l => {
+    const n = parseInt(own(l), 10);
+    let p = l, d = 0;
+    while (p && p !== document.body && d < 12) {
+      let s = sets.get(p);
+      if (!s) { s = new Set(); sets.set(p, s); }
+      s.add(n);
+      p = p.parentElement; d++;
+    }
+  });
+  let best = null, bestSize = Infinity;
+  sets.forEach((s, el) => {
+    if (s.size >= 28 && s.has(1) && s.has(28)) {
+      const sz = el.getElementsByTagName('*').length;
+      if (sz < bestSize) { best = el; bestSize = sz; }
+    }
+  });
+  if (!best) return {found: false, leaves: leaves.length};
+  let root = best, p = best;
+  for (let i = 0; i < 8 && p && p !== document.body; i++) {
+    if (navBtn(p, 'prev') && navBtn(p, 'next')) { root = p; break; }
+    p = p.parentElement;
+  }
+  root.setAttribute('data-pw-cal', '1');
+  return {found: true, leaves: leaves.length, tag: root.tagName.toLowerCase(), cls: clsOf(root).slice(0, 100),
+          text: (root.innerText || '').replace(/\s+/g, ' ').slice(0, 160), html: root.outerHTML.slice(0, 1500)};
+}"""
+
+CAL_TEXT_JS = """() => {
+  const r = document.querySelector('[data-pw-cal]');
+  return r ? (r.innerText || '') : '';
+}"""
+
+CAL_NAV_JS = "(dir) => {" + CAL_COMMON_JS + r"""
+  document.querySelectorAll('[data-pw-nav]').forEach(e => e.removeAttribute('data-pw-nav'));
+  const root = document.querySelector('[data-pw-cal]');
+  if (!root) return {ok: false, why: 'no-calendar'};
+  const b = navBtn(root, dir);
+  if (!b) return {ok: false, why: 'no-' + dir + '-button'};
+  b.setAttribute('data-pw-nav', '1');
+  return {ok: true, disabled: isDis(b), meta: meta(b).replace(/\s+/g, ' ').slice(0, 80)};
+}"""
+
+CAL_DAY_JS = "(day) => {" + CAL_COMMON_JS + r"""
+  document.querySelectorAll('[data-pw-day]').forEach(e => e.removeAttribute('data-pw-day'));
+  const root = document.querySelector('[data-pw-cal]');
+  if (!root) return {ok: false, why: 'no-calendar'};
+  const BAD = /outside|other-?month|prev-?month|next-?month|adjacent|disabled|muted|not-?current|out-of-month/;
+  const cell = e => e.closest('button, [role="gridcell"], [role="button"], td, li') || e;
+  const isBad = c => {
+    let n = c;
+    for (let i = 0; i < 3 && n && n !== root; i++) {
+      if (BAD.test(clsOf(n).toLowerCase()) || n.disabled || n.getAttribute('aria-disabled') === 'true' ||
+          n.getAttribute('aria-hidden') === 'true') return true;
+      n = n.parentElement;
+    }
+    return false;
+  };
+  const list = [], seen = new Set();
+  Array.from(root.querySelectorAll('*')).forEach(e => {
+    if (!vis(e) || !/^\d{1,2}$/.test(own(e)) || parseInt(own(e), 10) !== day) return;
+    const c = cell(e);
+    if (seen.has(c)) return;
+    seen.add(c);
+    list.push({c: c, bad: isBad(c)});
+  });
+  let good = list.filter(x => !x.bad);
+  if (!good.length) good = list;
+  if (!good.length) return {ok: false, why: 'day-not-found', count: 0};
+  // days of the neighbouring months: late days of the previous month come first, early days of the next month last
+  const pick = good.length === 1 ? good[0] : (day >= 15 ? good[good.length - 1] : good[0]);
+  pick.c.setAttribute('data-pw-day', '1');
+  return {ok: true, count: list.length, good: good.length, cls: clsOf(pick.c).slice(0, 80)};
+}"""
+
+CAL_OK_JS = "() => {" + CAL_COMMON_JS + r"""
+  document.querySelectorAll('[data-pw-ok]').forEach(e => e.removeAttribute('data-pw-ok'));
+  const root = document.querySelector('[data-pw-cal]');
+  if (!root) return false;
+  const scope = root.closest('[role="dialog"], .MuiPopper-root, .mat-datepicker-content, .MuiDialog-root') || root;
+  const btn = Array.from(scope.querySelectorAll('button, [role="button"]')).find(b => vis(b) &&
+      /^(ok|apply|set|done|select|choose|confirm|simpan|pilih|terapkan)$/i.test((b.innerText || '').trim()));
+  if (!btn) return false;
+  btn.setAttribute('data-pw-ok', '1');
+  return true;
+}"""
+
+CAL_ICON_JS = "() => {" + CAL_COMMON_JS + r"""
+  document.querySelectorAll('[data-pw-icon]').forEach(e => e.removeAttribute('data-pw-icon'));
+  const inp = document.querySelector('[data-pw-target]');
+  if (!inp) return false;
+  const r0 = inp.getBoundingClientRect();
+  let p = inp.parentElement;
+  for (let i = 0; i < 4 && p; i++) {
+    const c = Array.from(p.querySelectorAll('button, [role="button"], svg, i, [class*="icon" i], [class*="calendar" i], ' +
+                                            '[aria-label*="calendar" i], [aria-label*="date" i]'))
+      .filter(e => e !== inp && !e.contains(inp) && vis(e))
+      .filter(e => {
+        const r = e.getBoundingClientRect();
+        return Math.abs((r.top + r.bottom) / 2 - (r0.top + r0.bottom) / 2) < 30 && r.width < 80;
+      });
+    if (c.length) { c[0].setAttribute('data-pw-icon', '1'); return true; }
+    p = p.parentElement;
+  }
+  return false;
+}"""
+
+CAL_DIAG_JS = "() => {" + CAL_COMMON_JS + r"""
+  const out = [];
+  document.querySelectorAll("[class*='calendar' i], [class*='datepicker' i], [class*='date-picker' i], " +
+                            "[class*='picker' i], [class*='popper' i], [class*='popover' i], [role='dialog'], [role='grid']")
+    .forEach(e => {
+      if (!vis(e)) return;
+      out.push({tag: e.tagName.toLowerCase(), cls: clsOf(e).slice(0, 120), html: e.outerHTML.slice(0, 1800)});
+    });
+  return out.slice(0, 6);
+}"""
+
+MAX_CAL_STEPS = 150          # month clicks allowed to reach the wanted month (about 12 years)
+
+_CAL_MON = (r"januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|november|desember|january|february|"
+            r"march|may|june|july|august|october|december|jan|feb|mar|apr|jun|jul|aug|agu|agt|ags|sept|sep|oct|okt|nov|"
+            r"dec|des")
+_CAL_RE1 = re.compile(rf"(?<![a-z])({_CAL_MON})[a-z]*\.?,?\s*(\d{{4}})", re.I)      # October 2026 / Okt 2026
+_CAL_RE2 = re.compile(rf"(\d{{4}})\s*,?\s*({_CAL_MON})(?![a-z])", re.I)             # 2026 October
+
+
+def parse_cal_header(text: str):
+    """(year, month) shown in the calendar header, or None."""
+    m = _CAL_RE1.search(text or "")
+    if m:
+        mon = _MONTHS.get(m.group(1)[:3].lower())
+        if mon:
+            return int(m.group(2)), mon
+    m = _CAL_RE2.search(text or "")
+    if m:
+        mon = _MONTHS.get(m.group(2)[:3].lower())
+        if mon:
+            return int(m.group(1)), mon
+    return None
+
+
+def calendar_diagnostics(page, job_dir: Path, tag: str):
+    """Screenshot + HTML of everything that looks like a calendar (for fixing the picker if it fails)."""
+    take_shot(page, job_dir, f"shot_calendar_{tag}")
+    try:
+        items = page.evaluate(CAL_DIAG_JS)
+    except PWError as exc:
+        job_log(job_dir, f"CALENDAR DIAG failed: {str(exc)[:120]}", "WARNING")
+        return
+    job_log(job_dir, f"CALENDAR DIAG [{tag}]: {len(items)} calendar-like visible element(s)", "WARNING")
+    for it in items:
+        job_log(job_dir, f"  <{it['tag']} class='{it['cls']}'> {it['html'][:300]}", "WARNING")
+        append_dom(job_dir, "calendar_", f"[{tag}] <{it['tag']} class='{it['cls']}'>\n{it['html']}\n")
+
+
+def open_calendar(page, job_dir: Path, kind: str):
+    """Open the calendar of the Start/End Date box (click the box, then the calendar icon). Returns info or None."""
+    for how in ("input", "icon"):
+        try:
+            box = mark_control(page, kind, 15)
+            box.scroll_into_view_if_needed()
+            if how == "input":
+                safe_click(box)
+            else:
+                if not page.evaluate(CAL_ICON_JS):
+                    continue
+                safe_click(page.locator("[data-pw-icon]").first)
+        except (PWError, RuntimeError) as exc:
+            job_log(job_dir, f"[calendar] opening via {how} failed: {str(exc)[:120]}", "WARNING")
+            continue
+        end = time.time() + 3.5
+        while time.time() < end:
+            info = page.evaluate(CAL_FIND_JS)
+            if info.get("found"):
+                return info
+            page.wait_for_timeout(300)
+        job_log(job_dir, f"[calendar] no calendar after clicking the {how}.", "WARNING")
+        try:
+            page.keyboard.press("Escape")
+        except PWError:
+            pass
+        page.wait_for_timeout(300)
+    return None
+
+
+def calendar_goto_month(page, job_dir: Path, target: date):
+    """Click previous/next month until the header shows the target month."""
+    for step in range(MAX_CAL_STEPS + 1):
+        txt = page.evaluate(CAL_TEXT_JS)
+        if not txt:                                   # the root element was re-rendered: find it again
+            page.evaluate(CAL_FIND_JS)
+            txt = page.evaluate(CAL_TEXT_JS)
+        cur = parse_cal_header(txt)
+        if cur is None:
+            raise RuntimeError(f"cannot read the month in the calendar header: {txt[:80]!r}")
+        diff = (target.year * 12 + target.month) - (cur[0] * 12 + cur[1])
+        if diff == 0:
+            if step:
+                job_log(job_dir, f"[calendar] reached {target:%B %Y} after {step} click(s).")
+            return
+        direction = "next" if diff > 0 else "prev"
+        res = page.evaluate(CAL_NAV_JS, direction)
+        if not res.get("ok"):
+            raise RuntimeError(f"no '{direction}' month button in the calendar ({res.get('why')})")
+        if res.get("disabled"):
+            raise RuntimeError(f"the '{direction}' month button is disabled at {cur[1]:02d}/{cur[0]} "
+                               f"(the date is outside what the calendar allows)")
+        safe_click(page.locator("[data-pw-nav]").first)
+        page.wait_for_timeout(250)
+    raise RuntimeError(f"could not reach {target:%B %Y} within {MAX_CAL_STEPS} clicks")
+
+
+def pick_date_via_calendar(page, job_dir: Path, kind: str, value: date, close: bool = True):
+    """Choose `value` in the calendar of the Start/End Date box and verify the box shows it."""
+    label = "Start Date" if kind == "start" else "End Date"
+    want = re.sub(r"\D", "", value.strftime(DATE_INPUT_FORMAT))
+    last_error = ""
+    for attempt in (1, 2):
+        try:
+            info = open_calendar(page, job_dir, kind)
+            if not info:
+                raise RuntimeError("the calendar did not open")
+            if attempt == 1 and not page_state_flag("cal_logged"):
+                job_log(job_dir, f"[calendar] detected <{info['tag']} class='{info['cls']}'> text={info['text']!r}")
+            calendar_goto_month(page, job_dir, value)
+            res = page.evaluate(CAL_DAY_JS, value.day)
+            if not res.get("ok"):
+                raise RuntimeError(f"day {value.day} not found in the calendar ({res.get('why')})")
+            safe_click(page.locator("[data-pw-day]").first)
+            got, end = "", time.time() + 3
+            while time.time() < end:
+                page.wait_for_timeout(300)
+                got = _box_digits(page, kind)
+                if got == want:
+                    break
+            if got != want and page.evaluate(CAL_OK_JS):
+                safe_click(page.locator("[data-pw-ok]").first)
+                page.wait_for_timeout(500)
+                got = _box_digits(page, kind)
+            if got == want:
+                job_log(job_dir, f"[{label}] picked {value:%d-%m-%Y} in the calendar (box digits {got}).")
+                if close and page.evaluate(CAL_FIND_JS).get("found"):
+                    try:
+                        page.keyboard.press("Escape")
+                    except PWError:
+                        pass
+                    page.wait_for_timeout(400)
+                    if _box_digits(page, kind) != want:          # Escape reverted the choice: pick it again, keep open
+                        job_log(job_dir, f"[{label}] Escape reverted the date; choosing it again.", "WARNING")
+                        return pick_date_via_calendar(page, job_dir, kind, value, close=False)
+                return
+            raise RuntimeError(f"after clicking day {value.day} the box shows '{got}' instead of '{want}'")
+        except (PWError, RuntimeError) as exc:
+            last_error = str(exc)[:200]
+            job_log(job_dir, f"[{label}] calendar attempt {attempt}/2 failed: {last_error}", "WARNING")
+            calendar_diagnostics(page, job_dir, f"{kind}{attempt}")
+            try:
+                page.keyboard.press("Escape")
+            except PWError:
+                pass
+            page.wait_for_timeout(500)
+    raise RuntimeError(f"Could not pick {label} {value:%d-%m-%Y} in the calendar: {last_error}")
+
+
+_FLAGS = {}
+
+
+def page_state_flag(name: str) -> bool:
+    """True after the first call with this name (used to log the detected calendar only once)."""
+    if _FLAGS.get(name):
+        return True
+    _FLAGS[name] = True
+    return False
+
+
+DATE_STRATEGIES = ("calendar", "calendar_force", "tab")
+_DATE_MODES = {"tab": ("typed", "digits")}     # last resort: type into the box (the site normally blocks this)
 
 
 def pw_set_date(page, job_dir: Path, label: str, value: date, strategy: str = "tab"):
@@ -825,7 +1148,28 @@ def _box_digits(page, kind: str) -> str:
 
 
 def set_dates(page, job_dir: Path, start_d: date, end_d: date, strategy: str, force: bool):
-    """Fill both date boxes. force=False skips a box that already shows the wanted date."""
+    """
+    calendar / calendar_force: CLICK the Start Date in the calendar (the site then fills End Date with today).
+    calendar skips the pick when the box already shows the date, calendar_force always picks it.
+    tab: type into the boxes (last resort). force=False skips a box that already shows the wanted date.
+    """
+    want_s = re.sub(r"\D", "", start_d.strftime(DATE_INPUT_FORMAT))
+    want_e = re.sub(r"\D", "", end_d.strftime(DATE_INPUT_FORMAT))
+    if strategy.startswith("calendar"):
+        if strategy == "calendar_force" or _box_digits(page, "start") != want_s:
+            pick_date_via_calendar(page, job_dir, "start", start_d)
+            page.wait_for_timeout(800)                     # the site fills End Date with the current day
+        got_e = _box_digits(page, "end")
+        if got_e != want_e:
+            job_log(job_dir, f"End Date shows {got_e}, wanted {want_e}: choosing it in the calendar.")
+            try:
+                pick_date_via_calendar(page, job_dir, "end", end_d)
+            except RuntimeError as exc:
+                job_log(job_dir, f"Could not choose End Date ({str(exc)[:160]}); the box keeps {got_e}. "
+                                 f"Continuing with the date the site filled in.", "WARNING")
+        if _box_digits(page, "start") != want_s:
+            job_log(job_dir, f"Start Date no longer shows {want_s} after the End Date step.", "WARNING")
+        return
     items = (("Start Date", start_d, "start"), ("End Date", end_d, "end"))
     for label, value, kind in items:
         want = re.sub(r"\D", "", value.strftime(DATE_INPUT_FORMAT))
@@ -2589,6 +2933,7 @@ def retrieve_worker(job_dir: Path, username: str, password: str, start_d: date, 
         for old in job_dir.glob(pattern):
             old.unlink(missing_ok=True)
 
+    _FLAGS.clear()
     state = {"files": [], "hashes": {}, "resume_page": 1, "total_pages": 1, "session_no": 0, "page_size": None,
              "date_strategy": None}
     monitor = None
@@ -2735,7 +3080,7 @@ def render_workflow(job_dir: Path, job_id: str):
 
     # ------------------------------------------------------------ STEP 1
     st.subheader("Step 1 · Retrieve closed alarms")
-    st.caption("Logs in and opens CLOSED ALARM. For EVERY page it fills Start/End Date, clicks Apply, sets 500 items "
+    st.caption("Logs in and opens CLOSED ALARM. For EVERY page it picks the Start Date in the calendar, clicks Apply, sets 500 items "
                "per page, goes to that page and clicks Download Alarm › By Page. The dates inside the table and "
                "inside every downloaded file are checked against your range. All files are compiled into one "
                "Excel. The browser is restarted automatically when memory grows.")
