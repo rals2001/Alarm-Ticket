@@ -15,7 +15,7 @@ FLOW, repeated for EVERY page N:
   7. DOWNLOAD   : Download Alarm > By Page (one file per page); the file must exist and be non-empty.
   8. NEXT PAGE  : repeat the whole cycle for page N+1 until the last page.
 All page files are compiled into ONE Excel file.
-STEP 3  Download -> hand the compiled XLSX to the browser (no processing)
+STEP 2  Download -> hand the compiled XLSX to the browser (no processing)
 
 MEMORY MANAGEMENT
   * Guard measures the container WORKING SET (memory.current - inactive_file), 93 %, 3 samples in a row,
@@ -2776,10 +2776,9 @@ def render_workflow(job_dir: Path, job_id: str):
 
     # ------------------------------------------------------------ STEP 1
     st.subheader("Step 1 · Retrieve closed alarms")
-    st.caption("Logs in and opens CLOSED ALARM. For EVERY page it sets 500 items per page, picks the Start Date in "
-               "the real calendar (End Date is never touched), clicks Apply, re-checks the page size, goes to that "
-               "page, re-checks again and clicks Download Alarm › By Page. All files are compiled into one Excel. "
-               "The browser is restarted automatically when memory grows.")
+    st.caption("Make sure to select the correct Start Date and ensure the date range does not exceed 30 days. "
+               "considering that the End Date is automatically set to the CURRENT DAY. "
+               )
     show_status(s1)
     if s1["state"] == "error" and (job_dir / "error.png").exists():
         st.image(str(job_dir / "error.png"), caption="Browser screenshot when the error happened")
@@ -2815,8 +2814,8 @@ def render_workflow(job_dir: Path, job_id: str):
 
     st.divider()
 
-    # ------------------------------------------------------------ STEP 3
-    st.subheader("Step 3 · Download Result")
+    # ------------------------------------------------------------ STEP 2
+    st.subheader("Step 2 · Download Result")
     st.caption("Just hands you the compiled file from Step 1. No processing happens here.")
     if result_ok:
         rs, re_ = s1.get("range_start"), s1.get("range_end")
@@ -2869,7 +2868,7 @@ def render_workflow(job_dir: Path, job_id: str):
 
 def main():
     st.set_page_config(page_title="PMT Alarm Downloader", page_icon="🚨", layout="centered")
-    st.title("🚨 PMT Alarm – Closed Alarm")
+    st.title("🚨 PMT Alarm – Automate Extraction")
     cleanup_old_jobs()
 
     job_id = get_job_id()
